@@ -1,0 +1,147 @@
+"""Generate, install and remove the launchd jobs.
+
+The plists are built at install time from wherever this copy actually lives,
+so the repository contains no machine-specific paths and no secrets. Keys are
+read from the project's chmod-600 .env by the app itself, never passed through
+launchd, because a LaunchAgent plist is world-readable and gets backed up.
+"""
+from __future__ import annotations
+
+import os
+import plistlib
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from .config import PROJECT_ROOT, Config
+
+LABEL_PREFIX = "local.fily"
+JOBS = ("run", "alert", "bot")
+AGENTS = Path.home() / "Library" / "LaunchAgents"
+
+# Label prefixes used by earlier builds. If the prefix ever changes, add the
+# old one here so upgraded machines drop their old jobs instead of running two
+# copies of everything.
+LEGACY_PREFIXES: tuple[str, ...] = ()
+
+
+def label(job: str) -> str:
+    return f"{LABEL_PREFIX}.{job}"
+
+
+def plist_path(job: str) -> Path:
+    return AGENTS / f"{label(job)}.plist"
+
+
+def entrypoint() -> Path:
+    """The `organize` script inside this copy's virtualenv."""
+    candidate = Path(sys.executable).parent / "organize"
+    if candidate.exists():
+        return candidate
+    return PROJECT_ROOT / ".venv" / "bin" / "organize"
+
+
+def build(job: str, cfg: Config) -> dict:
+    logs = cfg.state_dir / "logs"
+    d: dict = {
+        "Label": label(job),
+        "ProgramArguments": [str(entrypoint()), job],
+        "EnvironmentVariables": {
+            "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PYTHONUNBUFFERED": "1",
+        },
+        "WorkingDirectory": str(PROJECT_ROOT),
+        "StandardOutPath": str(logs / f"{job}.stdout.log"),
+        "StandardErrorPath": str(logs / f"{job}.stderr.log"),
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+    }
+    if job == "bot":
+        # Always on; launchd restarts it after a crash, a network drop, a
+        # reboot, or its own deliberate exit when its source changes.
+        d.update({"RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 20})
+    else:
+        s = cfg.schedule
+        hour, minute = ((s.run_hour, s.run_minute) if job == "run"
+                        else (s.alert_hour, s.alert_minute))
+        d.update({"RunAtLoad": False, "ThrottleInterval": 300,
+                  "StartCalendarInterval": {"Hour": hour, "Minute": minute}})
+    return d
+
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True)
+
+
+def _domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+@dataclass
+class InstallResult:
+    installed: list[str]
+    removed_legacy: list[str]
+    failed: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed and bool(self.installed)
+
+
+def remove_legacy() -> list[str]:
+    removed = []
+    for prefix in LEGACY_PREFIXES:
+        for job in JOBS:
+            old = f"{prefix}.{job}"
+            _launchctl("bootout", f"{_domain()}/{old}")
+            f = AGENTS / f"{old}.plist"
+            if f.exists():
+                f.unlink()
+                removed.append(old)
+    return removed
+
+
+def install(cfg: Config, jobs: tuple[str, ...] = JOBS) -> InstallResult:
+    """Write and register the jobs.
+
+    Must be run from a real login session (Terminal). launchctl registers into
+    the caller's domain, so bootstrapping from a sandboxed or short-lived
+    process yields jobs that silently vanish when it exits.
+    """
+    (cfg.state_dir / "logs").mkdir(parents=True, exist_ok=True)
+    AGENTS.mkdir(parents=True, exist_ok=True)
+    result = InstallResult(installed=[], removed_legacy=remove_legacy(), failed=[])
+
+    # A job not being installed this time (the bot, when Telegram was
+    # skipped) must not linger from an earlier install.
+    for job in set(JOBS) - set(jobs):
+        _launchctl("bootout", f"{_domain()}/{label(job)}")
+        plist_path(job).unlink(missing_ok=True)
+
+    for job in jobs:
+        dst = plist_path(job)
+        _launchctl("bootout", f"{_domain()}/{label(job)}")
+        dst.write_bytes(plistlib.dumps(build(job, cfg)))
+        r = _launchctl("bootstrap", _domain(), str(dst))
+        if r.returncode == 0:
+            result.installed.append(job)
+        else:
+            result.failed.append(f"{job}: {(r.stderr or r.stdout).strip()[:160]}")
+    return result
+
+
+def uninstall() -> list[str]:
+    removed = remove_legacy()
+    for job in JOBS:
+        _launchctl("bootout", f"{_domain()}/{label(job)}")
+        f = plist_path(job)
+        if f.exists():
+            f.unlink()
+            removed.append(label(job))
+    return removed
+
+
+def restart(job: str) -> bool:
+    r = _launchctl("kickstart", "-k", f"{_domain()}/{label(job)}")
+    return r.returncode == 0

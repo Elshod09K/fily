@@ -1,0 +1,70 @@
+# Fily — default configuration.
+#
+# Don't edit this file. `organize setup` writes your own config.yaml, which
+# only needs the settings you want to change; everything else is taken from
+# here. Hard safety rules live in organizer/safety.py and can't be overridden.
+
+# Folders to tidy. Only loose files at the top level are touched: anything
+# already inside a subfolder is considered organized and left alone.
+scan_roots:
+  - ~/Downloads
+  - ~/Desktop
+
+# When to run. launchd catches up on wake if the Mac was asleep.
+schedule:
+  run: "22:00"      # daily organize
+  alert: "08:00"    # morning check: delivers overnight failures, watchdog
+
+# Loose images/videos/audio are routed here instead of an in-place subfolder.
+# Destinations only — these are never scanned.
+media_destinations:
+  image: ~/Pictures/Inbox
+  video: ~/Movies/Inbox
+  audio: ~/Music/Inbox
+
+# Extra folders to never touch, on top of the built-in protections (system
+# folders, ~/Library, code projects, app bundles, Photos/Music libraries).
+deny_paths: []
+
+behaviour:
+  scan_depth: 1               # only loose files at the top of each folder
+  quarantine_hours: 24        # skip files touched more recently than this
+  max_moves_per_run: 150      # exceeded -> apply nothing, queue everything
+  run_budget_seconds: 900     # hard wall clock for a whole run
+  auto_confidence: 0.85       # auto-apply threshold for the categories below
+  auto_confidence_any: 0.95   # auto-apply threshold for any category
+  min_files_for_new_folder: 2 # don't invent a folder for fewer files than this
+  batch_size: 20              # files per AI call
+  snippet_chars: 800          # text extracted from each document
+  journal_retention_days: 90  # how long `organize undo` can reach back
+
+# Categories that may be applied automatically at `auto_confidence`.
+auto_safe_categories:
+  - installer
+  - archive
+  - screenshot
+  - image
+  - video
+  - audio
+  - web-page
+
+duplicates:
+  # Spare copies of byte-identical files. The oldest copy is always kept.
+  #   trash - send spares to the macOS Trash (Finder -> Put Back to recover)
+  #   stage - move them to _Duplicates/ and leave the decision to you
+  action: trash
+
+providers:
+  # Tried strictly in order; `attempts` is per entry. `organize setup` probes
+  # every candidate model with a real request and writes the ones that answer
+  # into your config.yaml — a model being listed by a provider is not proof
+  # your key can use it.
+  chain:
+    - {provider: gemini, model: gemini-flash-latest, attempts: 5}
+    - {provider: gemini, model: gemini-2.5-flash,    attempts: 3}
+  timeout_seconds: 120
+  backoff_base: 2.0
+  backoff_max: 30.0
+
+notify:
+  enabled: true

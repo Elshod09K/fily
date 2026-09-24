@@ -1,0 +1,14 @@
+# Personal — never commit
+.env
+.env.tmp
+config.yaml
+config.yaml.bak
+state/
+
+# Build and tooling
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.DS_Store
