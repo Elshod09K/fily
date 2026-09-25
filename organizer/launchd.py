@@ -11,6 +11,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .config import PROJECT_ROOT, Config
@@ -109,14 +110,41 @@ def install(cfg: Config, jobs: tuple[str, ...] = JOBS) -> InstallResult:
 
     for job in jobs:
         dst = plist_path(job)
-        _launchctl("bootout", f"{_domain()}/{label(job)}")
+        _unload(job)
         dst.write_bytes(plistlib.dumps(build(job, cfg)))
-        r = _launchctl("bootstrap", _domain(), str(dst))
+        r = _bootstrap(dst)
         if r.returncode == 0:
             result.installed.append(job)
         else:
             result.failed.append(f"{job}: {(r.stderr or r.stdout).strip()[:160]}")
     return result
+
+
+def _loaded(job: str) -> bool:
+    return _launchctl("print", f"{_domain()}/{label(job)}").returncode == 0
+
+
+def _unload(job: str, wait: float = 15.0) -> None:
+    """Boot a job out and wait until launchd has actually let go of it.
+
+    `launchctl bootout` returns before a *running* job (the bot) has exited,
+    and bootstrapping the same label in that window fails with "Input/output
+    error" — which left the bot unregistered after every update.
+    """
+    _launchctl("bootout", f"{_domain()}/{label(job)}")
+    deadline = time.monotonic() + wait
+    while _loaded(job) and time.monotonic() < deadline:
+        time.sleep(0.25)
+
+
+def _bootstrap(plist: Path, attempts: int = 4) -> subprocess.CompletedProcess:
+    r = _launchctl("bootstrap", _domain(), str(plist))
+    for i in range(1, attempts):
+        if r.returncode == 0:
+            break
+        time.sleep(i)                 # launchd sometimes needs a moment more
+        r = _launchctl("bootstrap", _domain(), str(plist))
+    return r
 
 
 def uninstall() -> list[str]:
