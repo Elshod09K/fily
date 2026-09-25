@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import ssl
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -92,7 +91,7 @@ def load_chat_id(state_dir: Path) -> int | None:
     if not p.exists():
         return None
     try:
-        return int(json.loads(p.read_text())["chat_id"])
+        return int(json.loads(p.read_text(encoding="utf-8"))["chat_id"])
     except (json.JSONDecodeError, KeyError, ValueError, OSError):
         return None
 
@@ -107,11 +106,10 @@ def save_chat_id(state_dir: Path, chat_id: int, who: str = "") -> None:
     p = pairing_path(state_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(
-        {"chat_id": chat_id, "who": who, "paired_at": time.time()}, indent=2))
-    try:
-        p.chmod(0o600)
-    except OSError:
-        pass
+        {"chat_id": chat_id, "who": who, "paired_at": time.time()}, indent=2),
+        encoding="utf-8")
+    from . import host
+    host.restrict_to_owner(p)
 
 
 def clear_chat_id(state_dir: Path) -> None:
@@ -247,17 +245,15 @@ def new_pairing_code(state_dir: Path) -> str:
     code = secrets.token_urlsafe(12)          # [A-Za-z0-9_-], deep-link safe
     p = _code_path(state_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(code)
-    try:
-        p.chmod(0o600)
-    except OSError:
-        pass
+    p.write_text(code, encoding="utf-8")
+    from . import host
+    host.restrict_to_owner(p)
     return code
 
 
 def load_pairing_code(state_dir: Path) -> str | None:
     try:
-        code = _code_path(state_dir).read_text().strip()
+        code = _code_path(state_dir).read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return code or None

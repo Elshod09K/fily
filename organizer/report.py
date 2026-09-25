@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from . import host
 from .config import Config
 from .planner import Plan
 from .scanner import ScanResult
@@ -67,10 +68,10 @@ def write_report(cfg: Config, run_id: str, scan: ScanResult, plan: Plan,
         L.append(f"## Exact duplicates ({len(plan.duplicates)}, {_size(total)})")
         L.append("")
         if deleted:
-            L.append("Sent to the **macOS Trash**. The oldest copy of each was "
-                     "kept, and both files were re-checked as byte-identical "
-                     "immediately before deleting. To get one back: Finder → "
-                     "right-click → **Put Back**.")
+            L.append(f"Sent to the **{host.TRASH_NAME}**. The oldest copy of "
+                     "each was kept, and both files were re-checked as "
+                     "byte-identical immediately before deleting. To get one "
+                     f"back: {host.RESTORE_HINT}.")
         else:
             L.append("Moved to `_Duplicates/`. Nothing was deleted — review and "
                      "remove them yourself, or run `organize prune`.")

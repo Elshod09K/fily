@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import plistlib
-import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -106,6 +106,8 @@ def test_labels_are_generic():
 
 # --------------------------------------------------------------- permissions
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="chmod can't make a folder unreadable on Windows")
 def test_unreadable_root_is_reported_not_treated_as_empty(cfg):
     """os.walk swallows permission errors and yields nothing, so a folder
     macOS hides from a background job looked exactly like an empty one."""
@@ -120,6 +122,20 @@ def test_unreadable_root_is_reported_not_treated_as_empty(cfg):
     assert res.unreadable_roots and res.unreadable_roots[0][0] == root
 
 
+def test_a_root_the_os_refuses_is_reported_on_any_platform(cfg, monkeypatch):
+    """Same guarantee as above, without relying on chmod semantics."""
+    real = os.scandir
+
+    def refuse(path):
+        if Path(path) == cfg.scan_roots[0]:
+            raise PermissionError(1, "Operation not permitted")
+        return real(path)
+
+    monkeypatch.setattr(scanner.os, "scandir", refuse)
+    res = scanner.scan(cfg)
+    assert res.unreadable_roots and res.unreadable_roots[0][0] == cfg.scan_roots[0]
+
+
 def test_readable_root_is_not_flagged(cfg):
     res = scanner.scan(cfg)
     assert res.unreadable_roots == []
@@ -128,10 +144,10 @@ def test_readable_root_is_not_flagged(cfg):
 # ------------------------------------------------------------------- pairing
 
 def test_pairing_code_is_private_and_deep_link_safe(tmp_path):
+    from organizer import host
     code = telegram.new_pairing_code(tmp_path)
     assert all(c.isalnum() or c in "-_" for c in code) and len(code) >= 12
-    mode = stat.S_IMODE((tmp_path / "pairing_code").stat().st_mode)
-    assert mode == 0o600
+    assert host.owner_only(tmp_path / "pairing_code")
 
 
 @pytest.mark.parametrize("text,ok", [
@@ -184,7 +200,8 @@ def test_env_is_owner_only_and_merges(tmp_path):
     setup.write_env({"GEMINI_API_KEY": "new", "TELEGRAM_BOT_TOKEN": "t"}, env)
     vals = setup.read_env(env)
     assert vals == {"KEEP_ME": "1", "GEMINI_API_KEY": "new", "TELEGRAM_BOT_TOKEN": "t"}
-    assert stat.S_IMODE(env.stat().st_mode) == 0o600
+    from organizer import host
+    assert host.owner_only(env)
 
 
 def test_empty_value_removes_a_key(tmp_path):

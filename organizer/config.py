@@ -30,7 +30,8 @@ def load_env(path: Path = ENV_FILE) -> list[str]:
     if not path.exists():
         return loaded
     mode = path.stat().st_mode & 0o777
-    if mode & 0o077:
+    # Windows has no permission bits to check; setup restricts the ACL instead.
+    if os.name != "nt" and mode & 0o077:
         import warnings
         warnings.warn(
             f"{path} is mode {mode:o}; tighten it with: chmod 600 {path}",
@@ -53,7 +54,12 @@ def load_env(path: Path = ENV_FILE) -> list[str]:
 
 
 def expand(p: str | Path) -> Path:
-    return Path(os.path.expandvars(str(p))).expanduser().resolve()
+    """Expand ~ and $VARS. On Windows ~/Desktop, ~/Downloads and friends map
+    to where the shell really keeps them — OneDrive usually relocates the
+    Desktop — so one config file means the same folders on either OS."""
+    from . import host
+    s = host.map_known_folder(os.path.expandvars(str(p)))
+    return Path(s).expanduser().resolve()
 
 
 @dataclass(frozen=True)
@@ -167,15 +173,15 @@ def load(path: Path | None = None) -> Config:
     path = path or DEFAULT_CONFIG
     if not path.exists():
         if path == DEFAULT_CONFIG:
-            raise ConfigError(
-                "not set up yet — run:  .venv/bin/organize setup")
+            from . import host
+            raise ConfigError(f"not set up yet — run:  {host.CLI} setup")
         raise ConfigError(f"config not found: {path}")
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     # The personal config only has to hold what differs from the defaults, so
     # upgrades that add settings work without anyone editing their file. An
     # explicit --config path is taken as complete (tests rely on this).
     if path == DEFAULT_CONFIG and EXAMPLE_CONFIG.exists():
-        raw = deep_merge(yaml.safe_load(EXAMPLE_CONFIG.read_text()) or {}, raw)
+        raw = deep_merge(yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8")) or {}, raw)
 
     roots: list[Path] = []
     for r in raw.get("scan_roots") or []:

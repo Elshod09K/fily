@@ -6,13 +6,13 @@ the only thing standing between a stranger and someone's files.
 """
 from __future__ import annotations
 
-import json
+
 from pathlib import Path
 
 import pytest
 import yaml
 
-from organizer import bot, config, safety, telegram
+from organizer import bot, config, telegram
 
 
 @pytest.fixture
@@ -41,9 +41,9 @@ def test_unpaired_then_first_start_claims_it(cfg):
 
 
 def test_pairing_file_is_owner_only(cfg):
+    from organizer import host
     telegram.save_chat_id(cfg.state_dir, 111, "owner")
-    mode = telegram.pairing_path(cfg.state_dir).stat().st_mode & 0o777
-    assert mode == 0o600, f"pairing file is mode {mode:o}"
+    assert host.owner_only(telegram.pairing_path(cfg.state_dir))
 
 
 def test_unpair_allows_reclaiming(cfg):
@@ -119,10 +119,11 @@ def test_suggested_folder_relative(suggestion, expected):
     assert bot.suggested_folder(item) == expected
 
 
-def test_suggested_folder_from_absolute_path():
-    item = {"path": "/x/Downloads/a.pdf", "root": "/x/Downloads",
-            "suggestion": "/x/Downloads/Exams/SAT/a.pdf"}
-    assert bot.suggested_folder(item) == "Exams/SAT"
+def test_suggested_folder_from_absolute_path(tmp_path):
+    root = tmp_path / "Downloads"                    # absolute on either OS
+    item = {"path": str(root / "a.pdf"), "root": str(root),
+            "suggestion": str(root / "Exams" / "SAT" / "a.pdf")}
+    assert Path(bot.suggested_folder(item)) == Path("Exams/SAT")
 
 
 @pytest.mark.parametrize("typed", ["../../etc", "/etc", "~/Library", ".."])
@@ -194,25 +195,37 @@ def test_ssl_context_uses_certifi():
 
 # --------------------------------------------------------- inspecting a file
 
-def test_reveal_in_finder_calls_open_dash_r(tmp_path, monkeypatch):
+def test_reveal_asks_the_os_file_manager(tmp_path, monkeypatch):
     """`file://` links are not clickable in Telegram, so the bot asks Finder
-    directly — it runs on the same Mac as the files."""
+    or File Explorer directly — it runs on the same machine as the files."""
+    from organizer import host
     calls = []
-    monkeypatch.setattr(bot.subprocess, "run",
-                        lambda cmd, **k: calls.append(cmd))
+    monkeypatch.setattr(host, "reveal", lambda p: calls.append(p))
     f = tmp_path / "doc.pdf"
     f.write_bytes(b"x")
 
-    ok, msg = bot.reveal_in_finder(f)
+    ok, msg = bot.reveal_in_file_manager(f)
     assert ok, msg
-    assert calls and calls[0][:2] == ["/usr/bin/open", "-R"]
-    assert calls[0][2] == str(f)
+    assert calls == [f]
+    assert host.FILE_MANAGER in msg
 
 
 def test_reveal_reports_a_missing_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(bot.subprocess, "run", lambda *a, **k: None)
-    ok, msg = bot.reveal_in_finder(tmp_path / "gone.pdf")
+    from organizer import host
+    monkeypatch.setattr(host, "reveal", lambda p: None)
+    ok, msg = bot.reveal_in_file_manager(tmp_path / "gone.pdf")
     assert not ok and "no longer" in msg
+
+def test_reveal_commands_are_right_per_os(monkeypatch, tmp_path):
+    """The two real implementations, checked without running either."""
+    from organizer.host import macos, windows
+    seen = []
+    monkeypatch.setattr(macos.subprocess, "run", lambda cmd, **k: seen.append(cmd))
+    macos.reveal(tmp_path / "a b.pdf")
+    assert seen[-1][:2] == ["/usr/bin/open", "-R"]
+    monkeypatch.setattr(windows.subprocess, "run", lambda cmd, **k: seen.append(cmd))
+    windows.reveal(tmp_path / "a b.pdf")
+    assert seen[-1].startswith('explorer.exe /select,"') and seen[-1].endswith('a b.pdf"')
 
 
 def test_preview_refuses_oversized_files(tmp_path, monkeypatch):
@@ -252,7 +265,8 @@ def test_card_shows_an_excerpt_when_there_is_one():
     assert "Molding-sand" in text
     assert "blockquote" in text
     labels = [b["text"] for row in buttons for b in row]
-    assert any("Finder" in l for l in labels)
+    from organizer import host
+    assert any(host.FILE_MANAGER in l for l in labels)
     assert any("Send me it" in l for l in labels)
 
 

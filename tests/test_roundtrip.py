@@ -51,6 +51,10 @@ def messy(tmp_path: Path):
         "report_original.pdf": b"IDENTICAL CONTENT HERE",
         "report_copy.pdf": b"IDENTICAL CONTENT HERE",      # exact duplicate
         "screenshot.png": b"\x89PNG fake image data",
+        # Non-ASCII names are the norm, not an edge case: on Windows any text
+        # file written without an explicit encoding dies on these.
+        "Договор_образец.docx": b"contract template" * 40,
+        "Хўжалик шартнома.pdf": b"economic agreement" * 40,
     }
     for name, data in files.items():
         f = downloads / name
@@ -400,7 +404,11 @@ def test_trash_refuses_directories_and_symlinks(tmp_path, monkeypatch):
         trash.send_to_trash(d)
 
     real = tmp_path / "real.txt"; real.write_text("x")
-    link = tmp_path / "link.txt"; link.symlink_to(real)
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(real)
+    except OSError:
+        pytest.skip("no symlink privilege on this Windows account")
     with pytest.raises(trash.TrashError):
         trash.send_to_trash(link)
     assert real.exists()
@@ -420,7 +428,8 @@ def test_restore_explains_itself_when_trash_is_unreadable(tmp_path, monkeypatch)
 
     ok, why = trash.restore(entry)
     assert not ok
-    assert "Put Back" in why, why
+    from organizer import host
+    assert host.RESTORE_HINT in why, why
 
 
 def test_undo_reports_trashed_files_it_cannot_reach(messy, tmp_path, monkeypatch):
@@ -438,4 +447,41 @@ def test_undo_reports_trashed_files_it_cannot_reach(messy, tmp_path, monkeypatch
 
     res = applier.undo_run(cfg, jr.path)
     assert res.untrashed == 0 and res.skipped == 1
-    assert "Put Back" in res.problems[0][1]
+    from organizer import host
+    assert host.RESTORE_HINT in res.problems[0][1]
+
+
+def test_non_ascii_names_survive_report_queue_and_undo(messy, monkeypatch, tmp_path):
+    """Scan → plan → move → report → review queue → undo, with Cyrillic and
+    Uzbek names, which break any file I/O that relies on Windows' default
+    code page."""
+    from organizer import report
+
+    cfg, downloads, _ = messy
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path / "st")
+    before = manifest(downloads)
+
+    res = scanner.scan(cfg)
+    names = {f.name for f in res.files}
+    assert "Договор_образец.docx" in names and "Хўжалик шартнома.pdf" in names
+
+    groups, _ = dedupe.find_duplicates(res.files)
+    dedupe.ensure_hashes(res.files)
+    decisions = fake_decisions(res.files)
+    for f in res.files:
+        if f.name.startswith(("Договор", "Хўжалик")):
+            decisions[f.file_id].folder = "Шартномалар"
+            decisions[f.file_id].confidence = 0.99
+    plan = planner.build_plan(cfg, res.files, decisions, groups)
+
+    jr = journal.Journal(cfg, "unicode")
+    applied = applier.apply_moves(cfg, plan.auto + plan.duplicates, jr)
+    assert applied.failed == 0, applied.errors
+    assert (downloads / "Шартномалар" / "Договор_образец.docx").exists()
+
+    out = report.write_report(cfg, "unicode", res, plan, applied, False)
+    assert "Договор_образец.docx" in out.read_text(encoding="utf-8")
+
+    undone = applier.undo_run(cfg, jr.path)
+    assert undone.skipped == 0, undone.problems
+    assert manifest(downloads) == before

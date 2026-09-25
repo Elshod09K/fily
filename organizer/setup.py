@@ -21,13 +21,12 @@ import yaml
 from rich.console import Console
 
 from . import config as cfgmod
-from . import launchd, safety, telegram
+from . import host, launchd, safety, telegram
 from .providers import catalog
 
 console = Console()
 HOME = Path.home()
 
-FDA_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
 PROBE_LABEL = f"{launchd.LABEL_PREFIX}.probe"
 
 
@@ -56,6 +55,8 @@ class Prompter:
         if not self.interactive:
             return existing
         hint = f" [Enter to keep {mask(existing)}]" if existing else " [Enter to skip]"
+        if host.IS_WINDOWS:
+            hint += " (right-click to paste; nothing shows as you type)"
         try:
             ans = getpass.getpass(f"{question}{hint}: ").strip()
         except EOFError:
@@ -109,7 +110,7 @@ def write_env(updates: dict[str, str], path: Path = cfgmod.ENV_FILE) -> None:
         for k, v in current.items():
             fh.write(f"{k}={v}\n")
     os.replace(tmp, path)
-    os.chmod(path, 0o600)
+    host.restrict_to_owner(path)
     for k, v in updates.items():
         if v:
             os.environ[k] = v
@@ -291,9 +292,9 @@ def write_config(roots: list[str], run_at: str, chain: list[dict]) -> Path:
     path = cfgmod.DEFAULT_CONFIG
     data: dict = {}
     if path.exists():
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         backup = path.with_suffix(".yaml.bak")
-        backup.write_text(path.read_text())
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     data["scan_roots"] = roots
     sched = data.get("schedule") if isinstance(data.get("schedule"), dict) else {}
     sched["run"] = run_at
@@ -309,7 +310,7 @@ def write_config(roots: list[str], run_at: str, chain: list[dict]) -> Path:
               "# Anything not set here comes from config.example.yaml —\n"
               "# copy a setting over to change it.\n\n")
     path.write_text(header + yaml.safe_dump(data, sort_keys=False,
-                                            allow_unicode=True, width=100))
+                                            allow_unicode=True, width=100), encoding="utf-8")
     return path
 
 
@@ -341,7 +342,7 @@ def probe_access_under_launchd(cfg) -> dict | None:
         for _ in range(60):
             if out.exists():
                 try:
-                    return json.loads(out.read_text())
+                    return json.loads(out.read_text(encoding="utf-8"))
                 except json.JSONDecodeError:
                     pass
             time.sleep(0.5)
@@ -352,36 +353,66 @@ def probe_access_under_launchd(cfg) -> dict | None:
         plist.unlink(missing_ok=True)
 
 
-def full_disk_access(p: Prompter, cfg) -> bool:
+def write_probe(root: Path) -> tuple[bool, str]:
+    """Can this interpreter create, rename and delete a file in `root`?
+
+    On Windows, Controlled folder access blocks *changes* by unknown programs
+    in protected folders while reading stays fine — so a read test passes and
+    every move then fails. It judges by program, and Task Scheduler runs the
+    same interpreter as this setup, so testing from here is representative.
+    """
+    import secrets as _secrets
+    probe = root / f".fily-write-check-{_secrets.token_hex(4)}"
+    moved = probe.with_name(probe.name + "-moved")
+    try:
+        probe.write_bytes(b"")
+        os.rename(probe, moved)
+        moved.unlink()
+        return True, ""
+    except OSError as e:
+        for f in (probe, moved):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        return False, e.strerror or type(e).__name__
+
+
+def _check_access(cfg) -> tuple[list[str], str]:
+    """(blocked folders, interpreter to allow)."""
+    if host.IS_WINDOWS:
+        blocked = [str(r) for r in cfg.scan_roots if not write_probe(r)[0]]
+        return blocked, host.interpreters_needing_access()[0]
+    result = probe_access_under_launchd(cfg)
+    if result is None:
+        return [], ""
+    blocked = [r for r, v in result["roots"].items() if not v["ok"]]
+    return blocked, result["interpreter"]
+
+
+def folder_access(p: Prompter, cfg) -> bool:
     step(6, "Folder access")
     for attempt in range(4):
-        with console.status("Checking what a background job can see…"):
-            result = probe_access_under_launchd(cfg)
-        if result is None:
-            console.print("  [yellow]Couldn't run the check; `organize health` "
-                          "will verify tonight.[/yellow]")
-            return True
-        blocked = [r for r, v in result["roots"].items() if not v["ok"]]
+        with console.status("Checking Fily can work in your folders…"):
+            blocked, interp = _check_access(cfg)
         if not blocked:
-            console.print("  [green]✓[/green] Fily can read every folder in the "
-                          "background")
+            console.print("  [green]✓[/green] Fily can work in every folder")
             return True
-        interp = result["interpreter"]
-        console.print(f"  [red]✗ macOS is hiding {len(blocked)} folder(s) from "
-                      "background jobs.[/red]")
-        console.print(
-            "  One-time fix: [bold]System Settings → Privacy & Security → Full "
-            "Disk Access[/bold]\n  → click [bold]+[/bold] → press [bold]⌘⇧G[/bold] "
-            "→ paste this path → Open → make sure it's switched on:\n"
-            f"\n    [bold]{interp}[/bold]\n")
+        what = ("Windows Security is blocking changes in" if host.IS_WINDOWS
+                else "macOS is hiding")
+        console.print(f"  [red]✗ {what} {len(blocked)} folder(s) from "
+                      "Fily.[/red]")
+        console.print("  " + host.access_fix(interp))
         if not p.interactive:
             return False
         if attempt == 0:
-            subprocess.run(["/usr/bin/open", FDA_PANE], capture_output=True)
-            subprocess.run(["/bin/sh", "-c", f"printf %s '{interp}' | pbcopy"],
-                           capture_output=True)
-            console.print("  [dim](Settings is open, and the path is on your "
-                          "clipboard.)[/dim]")
+            try:
+                host.open_url(host.ACCESS_PANE)
+                host.copy_to_clipboard(interp)
+                console.print("  [dim](Settings is open, and the path is on your "
+                              "clipboard.)[/dim]")
+            except Exception:
+                pass
         if not p.yes("Done? Check again", True):
             console.print("  [yellow]Skipped. Fily will message you about this "
                           "on its first run.[/yellow]")
@@ -421,7 +452,7 @@ def pair(p: Prompter, cfg, username: str, wait: bool) -> bool:
 # ------------------------------------------------------------------- driver
 
 def run(args) -> int:
-    interactive = sys.stdin.isatty() and not args.yes
+    interactive = host.stdin_is_interactive() and not args.yes
     p = Prompter(interactive)
 
     console.print("\n[bold]Fily setup[/bold] — a few questions, then it runs "
@@ -429,14 +460,14 @@ def run(args) -> int:
     console.print(
         "[dim]What it does: every day it looks at loose files in the folders "
         "you choose and moves each into a sensible subfolder.\n"
-        "What it never does: erase anything (deleting means the Trash), touch "
+        f"What it never does: erase anything (deleting means the {host.TRASH_NAME}), touch "
         "code projects, apps or photo libraries, or send your files anywhere — "
         "only names and short text excerpts go to the AI.[/dim]")
 
     env = read_env()
     existing_cfg: dict = {}
     if cfgmod.DEFAULT_CONFIG.exists():
-        existing_cfg = yaml.safe_load(cfgmod.DEFAULT_CONFIG.read_text()) or {}
+        existing_cfg = yaml.safe_load(cfgmod.DEFAULT_CONFIG.read_text(encoding="utf-8")) or {}
         console.print("\n[dim]Existing setup found — press Enter to keep any "
                       "current value.[/dim]")
 
@@ -463,18 +494,22 @@ def run(args) -> int:
         console.print("  [yellow]--skip-install: nothing scheduled[/yellow]")
         return 0
 
-    jobs = launchd.JOBS if token else tuple(j for j in launchd.JOBS if j != "bot")
-    res = launchd.install(cfg, jobs)
+    sched = host.scheduler()
+    jobs = sched.JOBS if token else tuple(j for j in sched.JOBS if j != "bot")
+    res = sched.install(cfg, jobs)
     for line in res.failed:
         console.print(f"  [red]{line}[/red]")
     if res.failed:
-        console.print("[red]Scheduling failed.[/red] Run setup from the "
-                      "Terminal app (not an editor or IDE terminal).")
+        console.print("[red]Scheduling failed.[/red] "
+                      + ("Run setup from the Terminal app (not an editor or "
+                         "IDE terminal)." if host.IS_MAC else
+                         "Try running install.cmd again."))
         return 1
     console.print(f"  [green]✓[/green] scheduled daily at {run_at}")
 
-    access_ok = full_disk_access(p, cfg)
-    paired = pair(p, cfg, bot_username, wait=not args.no_wait) if token else False
+    access_ok = folder_access(p, cfg)
+    if token:
+        pair(p, cfg, bot_username, wait=not args.no_wait)
 
     console.print("\n[bold green]All set.[/bold green] You can close this "
                   "window.\n")
@@ -484,13 +519,9 @@ def run(args) -> int:
     if token:
         console.print("From Telegram: /status  /review  /run  /undo  /health")
     if not access_ok:
-        console.print("[yellow]Remember the Full Disk Access step above, or "
+        console.print("[yellow]Remember the folder-access step above, or those "
                       "folders will be skipped.[/yellow]")
-    console.print(
-        "\n[dim]Laptop tip: macOS runs nothing while asleep; a missed run "
-        "happens when you next open the lid. To run on time even when asleep:\n"
-        f"  sudo pmset repeat wakeorpoweron MTWRFSU "
-        f"{_minus(run_at, 3)}:00[/dim]")
+    console.print(f"\n[dim]{host.wake_tip(run_at, _minus)}[/dim]")
     return 0
 
 
@@ -511,5 +542,5 @@ def probe_access(out: Path) -> int:
     out.write_text(json.dumps({
         "interpreter": str(Path(sys.executable).resolve()),
         "roots": roots,
-    }))
+    }), encoding="utf-8")
     return 0

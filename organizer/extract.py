@@ -7,15 +7,14 @@ from __future__ import annotations
 
 import re
 import logging
-import signal
 import unicodedata
 import zipfile
-from contextlib import contextmanager
 from pathlib import Path
 
+from . import host
 from .scanner import FileRecord
 
-# Two guards, because a single pathological file must not stall a nightly run:
+# Two guards, because a single pathological file must not stall a daily run:
 #   * a size ceiling — a 111 MB scanned textbook has no useful first page and
 #     costs minutes to parse
 #   * a per-file wall clock — pypdf can crawl on a damaged or huge page tree
@@ -24,27 +23,6 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)
 MAX_EXTRACT_BYTES = 25 * 1024 * 1024
 EXTRACT_TIMEOUT_SECONDS = 20
 
-
-class ExtractTimeout(Exception):
-    pass
-
-
-@contextmanager
-def _time_limit(seconds: int):
-    """SIGALRM-based ceiling. Main thread only; a no-op elsewhere."""
-    try:
-        def _raise(signum, frame):
-            raise ExtractTimeout(f"extraction exceeded {seconds}s")
-        previous = signal.signal(signal.SIGALRM, _raise)
-    except ValueError:
-        yield          # not the main thread; run without the guard
-        return
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
 
 TEXTLIKE = {"txt", "md", "markdown", "csv", "tsv", "json", "yaml", "yml",
             "html", "htm", "xml", "rtf", "log", "tex", "bib", "srt", "vtt"}
@@ -198,9 +176,9 @@ def enrich(record: FileRecord, limit: int) -> None:
         return
 
     try:
-        with _time_limit(EXTRACT_TIMEOUT_SECONDS):
-            record.snippet, record.snippet_note = _dispatch(record, limit)
-    except ExtractTimeout:
+        record.snippet, record.snippet_note = host.run_with_timeout(
+            lambda: _dispatch(record, limit), EXTRACT_TIMEOUT_SECONDS)
+    except TimeoutError:
         record.snippet = ""
         record.snippet_note = (f"no text within {EXTRACT_TIMEOUT_SECONDS}s "
                                "— classified on name and type alone")

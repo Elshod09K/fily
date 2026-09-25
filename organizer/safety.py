@@ -6,45 +6,22 @@ A file wrongly skipped is a non-event; a file wrongly moved is a bug report.
 from __future__ import annotations
 
 import os
-import re
-import subprocess
 import time
+import unicodedata
 from pathlib import Path
+
+from . import host
 
 HOME = Path.home()
 
-# Never touched, under any configuration.
-#
-# These are listed in resolved form because config paths are resolved before
-# they get here, and on macOS /etc and /var are symlinks into /private. Note
-# what is deliberately absent: a blanket /private or /var would also cover
-# /private/var/folders, where every per-user temp directory lives, so the
-# specific sensitive children are named instead.
-HARD_DENY_ROOTS: tuple[Path, ...] = (
-    HOME / "Library",
-    HOME / ".Trash",
-    HOME / "Applications",
-    Path("/System"),
-    Path("/Library"),
-    Path("/Applications"),
-    Path("/usr"),
-    Path("/bin"),
-    Path("/sbin"),
-    Path("/cores"),
-    Path("/opt"),
-    Path("/etc"), Path("/private/etc"),
-    Path("/var/db"), Path("/private/var/db"),
-    Path("/var/root"), Path("/private/var/root"),
-    Path("/var/vm"), Path("/private/var/vm"),
-    Path("/var/log"), Path("/private/var/log"),
-)
+# Never touched, under any configuration. The lists are per-OS (see host/):
+# ~/Library and the system folders on a Mac; Windows, Program Files, AppData
+# and friends on Windows.
+HARD_DENY_ROOTS: tuple[Path, ...] = host.protected_roots()
 
-# Directories that hold only Apple-managed libraries. Destination-only.
-LIBRARY_ROOTS: tuple[Path, ...] = (
-    HOME / "Pictures",
-    HOME / "Movies",
-    HOME / "Music",
-)
+# Destination-only: loose media is routed *into* these, and on a Mac they
+# hold Apple-managed library bundles.
+LIBRARY_ROOTS: tuple[Path, ...] = host.library_roots()
 
 # Marker files that make a directory an atomic project: never descend, never move
 # individual members.
@@ -78,8 +55,28 @@ TRANSIENT_SUFFIXES: frozenset[str] = frozenset({
 
 TRANSIENT_PREFIXES: tuple[str, ...] = ("~$", ".~lock.", "._")
 
+# Shortcuts. A Windows Desktop is full of them, and tidying someone's app
+# shortcuts into a folder is not what they asked for.
+SHORTCUT_SUFFIXES: frozenset[str] = frozenset({".lnk", ".url", ".appref-ms"})
+
+# Names Windows reserves for devices; a folder called "Con" can't exist there,
+# and a Mac folder with such a name breaks when synced to a Windows machine.
+WINDOWS_RESERVED: frozenset[str] = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)})
+
 # Folder names the model may propose: conservative charset, no traversal.
-_FOLDER_SEGMENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9 _.\-&()']{0,48}$")
+# Folder names the model may propose. Letters and digits from any script are
+# fine — Uzbek or Russian users get folders in their own language — so the
+# rule is by Unicode category rather than an ASCII allow-list:
+#   letters (L*), combining marks (M*), decimal digits (Nd), plain space and
+#   _ . - & ( ) '  — and nothing else.
+# That still rejects everything that matters for safety: control and format
+# characters (so no NUL, newline, zero-width or right-to-left override, which
+# can disguise a name), every separator but a plain space, and look-alike
+# slashes such as U+2215 and U+FF0F, which are symbols (S*) or punctuation (P*).
+_SEGMENT_PUNCT = frozenset(" _.-&()'")
+_SEGMENT_MAX = 49
 MAX_FOLDER_DEPTH = 3
 
 
@@ -97,16 +94,16 @@ def root_rejection_reason(root: Path, cfg=None) -> str | None:
         return "not an absolute path"
     if root == HOME:
         return "the home directory itself is too broad to scan"
-    if root == Path("/"):
-        return "the filesystem root is never scannable"
+    if root == Path(root.anchor):
+        return "a whole drive is never scannable"
     if under_any(root, HARD_DENY_ROOTS):
         return "inside a system or library location"
+    if any(_is_under(p, root) for p in HARD_DENY_ROOTS):
+        return "contains system or application folders"
     for lib in LIBRARY_ROOTS:
         if _is_under(root, lib):
-            return (
-                f"{lib.name} holds Apple-managed library bundles; "
-                "it is a destination, never a scan root"
-            )
+            return (f"{lib.name} is where sorted media goes, so it is a "
+                    "destination, never a scan root")
     if is_bundle(root):
         return "this is a macOS package bundle, not a folder"
     if project_marker(root):
@@ -141,12 +138,17 @@ def skip_reason(path: Path, st: os.stat_result, quarantine_hours: int) -> str | 
     name = path.name
     if is_ignored_name(name):
         return "system metadata file"
-    if name.startswith("."):
+    if host.hidden(name, st):
         return "hidden file"
     if path.suffix.lower() in TRANSIENT_SUFFIXES:
         return "transient or in-flight file"
+    if path.suffix.lower() in SHORTCUT_SUFFIXES:
+        return "shortcut"
     if path.is_symlink():
         return "symlink"
+    cloud = host.cloud_only(st)
+    if cloud:
+        return cloud
     if st.st_nlink > 1:
         return f"hardlinked ({st.st_nlink} links)"
     if st.st_size == 0:
@@ -160,21 +162,9 @@ def skip_reason(path: Path, st: os.stat_result, quarantine_hours: int) -> str | 
 
 
 def is_file_open(path: Path) -> bool:
-    """True if another process currently holds the file open.
-
-    Checked immediately before a move. `lsof` missing or slow is treated as
-    "assume open" only on timeout, so we never race an active writer.
-    """
-    try:
-        r = subprocess.run(
-            ["/usr/sbin/lsof", "-t", "--", str(path)],
-            capture_output=True, timeout=10, check=False,
-        )
-        return bool(r.stdout.strip())
-    except subprocess.TimeoutExpired:
-        return True
-    except (FileNotFoundError, OSError):
-        return False
+    """True if another process currently holds the file open (lsof on a Mac,
+    an exclusive-open probe on Windows). Checked immediately before a move."""
+    return host.is_file_open(path)
 
 
 def validate_relative_folder(folder: str) -> tuple[bool, str]:
@@ -185,7 +175,9 @@ def validate_relative_folder(folder: str) -> tuple[bool, str]:
     """
     if not folder or not folder.strip():
         return False, "empty"
-    f = folder.strip().replace("\\", "/")
+    # One canonical spelling: macOS stores decomposed forms, so "é" typed two
+    # ways would otherwise become two different-looking-identical folders.
+    f = unicodedata.normalize("NFC", folder.strip()).replace("\\", "/")
     if f.startswith("/") or f.startswith("~"):
         return False, "absolute path"
     if ":" in f:
@@ -200,13 +192,29 @@ def validate_relative_folder(folder: str) -> tuple[bool, str]:
     for s in segments:
         if s in (".", ".."):
             return False, "path traversal"
+        if s.split(".")[0].lower() in WINDOWS_RESERVED:
+            return False, f"{s!r} is a reserved name on Windows"
         if s.endswith(".") or s.endswith(" "):
             return False, "segment ends with a dot or space"
         if Path(s).suffix.lower() in BUNDLE_SUFFIXES:
             return False, "segment looks like a package bundle"
-        if not _FOLDER_SEGMENT.match(s):
+        if not _segment_ok(s):
             return False, f"disallowed characters in {s!r}"
     return True, "/".join(segments)
+
+
+def _segment_ok(s: str) -> bool:
+    if not s or len(s) > _SEGMENT_MAX:
+        return False
+    first = unicodedata.category(s[0])
+    if not (first[0] in "LN" or s[0] == "_"):
+        return False
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat[0] in "LM" or cat == "Nd" or ch in _SEGMENT_PUNCT:
+            continue
+        return False
+    return True
 
 
 def resolve_destination(base: Path, folder: str, filename: str,

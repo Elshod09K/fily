@@ -8,6 +8,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import host
+
 
 class Busy(RuntimeError):
     def __init__(self, holder: dict):
@@ -17,13 +19,9 @@ class Busy(RuntimeError):
 
 
 def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    # Not os.kill(pid, 0): on Windows that terminates the process instead of
+    # checking it, which would kill the very run this lock protects.
+    return host.pid_alive(pid)
 
 
 @contextmanager
@@ -33,7 +31,7 @@ def run_lock(state_dir: Path, owner: str = "cli"):
 
     if path.exists():
         try:
-            holder = json.loads(path.read_text())
+            holder = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             holder = {}
         pid = holder.get("pid")
@@ -45,7 +43,7 @@ def run_lock(state_dir: Path, owner: str = "cli"):
     path.write_text(json.dumps({
         "pid": os.getpid(), "owner": owner, "started": time.time(),
         "started_human": time.strftime("%H:%M:%S"),
-    }))
+    }), encoding="utf-8")
     try:
         yield
     finally:

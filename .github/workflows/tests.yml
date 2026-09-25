@@ -1,0 +1,92 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    env:
+      # Keep Python's legacy default encoding (cp1252 on Windows) so any file
+      # I/O that forgets encoding="utf-8" fails here, not on a friend's PC.
+      PYTHONUTF8: "0"
+      # On Windows, also register and run real scheduled tasks, in a
+      # throwaway "FilyCI" folder of Task Scheduler.
+      FILY_CI_SCHEDULER: ${{ matrix.os == 'windows-latest' && '1' || '' }}
+      FILY_TASK_FOLDER: FilyCI
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e ".[dev]" pytest-github-actions-annotate-failures
+      - name: Test
+        shell: bash
+        run: |
+          python -m pytest -q -rA --tb=short 2>&1 | tee pytest-output.txt
+          exit ${PIPESTATUS[0]}
+      # Logs need a GitHub login; annotations are public. Publish skips, and
+      # whether the real scheduled-task test ran, where anyone can see them.
+      - name: Publish skipped tests
+        if: always()
+        shell: bash
+        run: |
+          # Actions runs bash with -e -o pipefail; a grep with no matches (no
+          # skips on this OS) must not fail the job.
+          set +e
+          grep -E "^(SKIPPED|PASSED).*(scheduler_end_to_end|SKIPPED)" pytest-output.txt \
+            | head -9 | while IFS= read -r line; do echo "::notice title=pytest::${line}"; done
+          grep -E "^SKIPPED" pytest-output.txt | head -9 \
+            | while IFS= read -r line; do echo "::notice title=skipped::${line}"; done
+          true
+
+  installer:
+    name: installer · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      # A fresh clone, no keys, no terminal: the installer must build the
+      # environment, then setup must explain what's missing, save nothing,
+      # and exit non-zero.
+      - name: install.cmd with no keys (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = cmd /c "install.cmd < NUL" 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 1) { throw "expected exit code 1, got $code" }
+          if ($out -notmatch 'At least one key is needed') { throw 'setup did not explain the missing key' }
+          if (Test-Path .env) { throw '.env was written without any keys' }
+          if (-not (Test-Path .venv\Scripts\pythonw.exe)) { throw 'the venv has no pythonw.exe for the scheduled tasks' }
+          & .venv\Scripts\python.exe -X utf8 -m organizer.cli --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'organize --help failed' }
+
+      - name: install.sh with no keys (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set +e
+          out=$(./install.sh < /dev/null 2>&1); code=$?
+          echo "$out"
+          [ "$code" -eq 1 ] || { echo "expected exit code 1, got $code"; exit 1; }
+          echo "$out" | grep -q "At least one key is needed" || { echo "no missing-key message"; exit 1; }
+          [ ! -e .env ] || { echo ".env was written without any keys"; exit 1; }

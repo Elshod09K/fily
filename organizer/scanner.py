@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import safety
+from . import host, safety
 from .config import Config
 
 
@@ -71,7 +71,8 @@ def _existing_subfolders(root: Path, limit: int = 60) -> list[str]:
             # anything inside it. Dropping it from dirnames stops the walk
             # descending, which is what previously let a skill's own
             # references/ folder be offered as somewhere to file documents.
-            if (n.startswith(".") or safety.is_bundle(child)
+            if (_hidden_dir(child) or safety.is_bundle(child)
+                    or host.is_link_dir(child)
                     or n in safety.PROJECT_MARKERS
                     or safety.project_marker(child)):
                 continue
@@ -82,6 +83,13 @@ def _existing_subfolders(root: Path, limit: int = 60) -> list[str]:
                 return sorted(out)
         dirnames[:] = keep
     return sorted(out)
+
+
+def _hidden_dir(path: Path) -> bool:
+    try:
+        return host.hidden(path.name, os.lstat(path))
+    except OSError:
+        return True
 
 
 def root_readable(root: Path) -> tuple[bool, str]:
@@ -150,12 +158,12 @@ def scan(cfg: Config, roots: tuple[Path, ...] | None = None) -> ScanResult:
             keep: list[str] = []
             for d in dirnames:
                 child = here / d
-                if d.startswith("."):
+                if _hidden_dir(child):
                     pruned.append((child, "hidden directory"))
                 elif safety.is_bundle(child):
-                    pruned.append((child, f"macOS package bundle ({child.suffix})"))
-                elif child.is_symlink():
-                    pruned.append((child, "symlinked directory"))
+                    pruned.append((child, f"package bundle ({child.suffix})"))
+                elif host.is_link_dir(child):
+                    pruned.append((child, "symlink or junction"))
                 elif safety.under_any(child, deny):
                     pruned.append((child, "inside a denied path"))
                 elif safety.project_marker(child):

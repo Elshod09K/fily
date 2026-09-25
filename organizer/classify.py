@@ -11,15 +11,14 @@ Two things matter here:
 """
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import extract, safety
+from . import extract
 from .config import Config
-from .providers.base import AllProvidersFailed, AttemptLog, run_chain
+from .providers.base import AttemptLog, run_chain
 from .scanner import FileRecord
 
 CATEGORIES: tuple[str, ...] = (

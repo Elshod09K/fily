@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from .hashing import quick_signature, sha256_file
 from .scanner import FileRecord

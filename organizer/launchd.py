@@ -11,13 +11,12 @@ import os
 import plistlib
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 from .config import PROJECT_ROOT, Config
+from .host.base import JOBS, InstallResult, JobState
 
 LABEL_PREFIX = "local.fily"
-JOBS = ("run", "alert", "bot")
 AGENTS = Path.home() / "Library" / "LaunchAgents"
 
 # Label prefixes used by earlier builds. If the prefix ever changes, add the
@@ -71,22 +70,11 @@ def build(job: str, cfg: Config) -> dict:
 
 
 def _launchctl(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True)
+    return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True, encoding="utf-8")
 
 
 def _domain() -> str:
     return f"gui/{os.getuid()}"
-
-
-@dataclass
-class InstallResult:
-    installed: list[str]
-    removed_legacy: list[str]
-    failed: list[str]
-
-    @property
-    def ok(self) -> bool:
-        return not self.failed and bool(self.installed)
 
 
 def remove_legacy() -> list[str]:
@@ -111,7 +99,7 @@ def install(cfg: Config, jobs: tuple[str, ...] = JOBS) -> InstallResult:
     """
     (cfg.state_dir / "logs").mkdir(parents=True, exist_ok=True)
     AGENTS.mkdir(parents=True, exist_ok=True)
-    result = InstallResult(installed=[], removed_legacy=remove_legacy(), failed=[])
+    result = InstallResult(removed_legacy=remove_legacy())
 
     # A job not being installed this time (the bot, when Telegram was
     # skipped) must not linger from an earlier install.
@@ -145,3 +133,54 @@ def uninstall() -> list[str]:
 def restart(job: str) -> bool:
     r = _launchctl("kickstart", "-k", f"{_domain()}/{label(job)}")
     return r.returncode == 0
+
+
+# ------------------------------------------------------------------ status
+
+def _launchctl_list() -> dict[str, tuple[int | None, int | None]]:
+    """label -> (pid, last exit). pid None means loaded but not running."""
+    out: dict[str, tuple[int | None, int | None]] = {}
+    try:
+        r = subprocess.run(["/bin/launchctl", "list"], capture_output=True,
+                           text=True, timeout=15, encoding="utf-8")
+    except (OSError, subprocess.TimeoutExpired):
+        return out
+    for line in r.stdout.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        pid, status, lbl = parts[0], parts[1], parts[2]
+        try:
+            out[lbl] = (None if pid == "-" else int(pid),
+                        None if status == "-" else int(status))
+        except ValueError:
+            continue
+    return out
+
+
+def _schedule_of(plist: Path) -> str:
+    try:
+        d = plistlib.loads(plist.read_bytes())
+    except (OSError, plistlib.InvalidFileException):
+        return ""
+    if d.get("KeepAlive"):
+        return "always on"
+    cal = d.get("StartCalendarInterval")
+    if isinstance(cal, dict):
+        return f"{cal.get('Hour', 0):02d}:{cal.get('Minute', 0):02d} daily"
+    return ""
+
+
+def job_states() -> list[JobState]:
+    listing = _launchctl_list()
+    states: list[JobState] = []
+    for job in JOBS:
+        lbl, plist = label(job), plist_path(job)
+        pid, exit_code = listing.get(lbl, (None, None))
+        states.append(JobState(
+            job=job, label=lbl, installed=plist.exists(),
+            registered=lbl in listing, running=pid is not None,
+            last_exit=exit_code,
+            schedule=_schedule_of(plist) if plist.exists() else "",
+            where=str(AGENTS)))
+    return states

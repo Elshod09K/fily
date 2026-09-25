@@ -1,12 +1,12 @@
 # Fily
 
-**A private file organizer for your Mac.** Every night it looks at the loose
-files piling up in your Downloads (and any other folders you choose), works out
-what each one is, and files it into a sensible folder — then messages you on
-Telegram with what it did.
+**A private file organizer for your Mac or Windows PC.** Every night it looks
+at the loose files piling up in your Downloads (and any other folders you
+choose), works out what each one is, and files it into a sensible folder —
+then messages you on Telegram with what it did.
 
-It runs on your own Mac with your own free AI key. Nothing is uploaded to a
-server you don't control, and it never erases anything.
+It runs on your own computer with your own free AI key. Nothing is uploaded to
+a server you don't control, and it never erases anything.
 
 ```
 🗂 Organized 14 files
@@ -21,12 +21,16 @@ server you don't control, and it never erases anything.
 
 ## What it will never do
 
-- **Erase a file.** Deleting means the macOS Trash — Finder → Put Back always works.
-- **Touch code projects, apps, or photo/music libraries.** Git repos, `node_modules`,
-  `.app` bundles, your Photos library and similar are skipped whole.
-- **Reorganize folders you already sorted.** Only *loose* files at the top of each
-  folder are touched.
-- **Move a file you're working on.** Anything modified in the last 24 hours is left alone.
+- **Erase a file.** Deleting means the Trash (Mac) or Recycle Bin (Windows) —
+  you can always put it back.
+- **Touch code projects, apps, or photo/music libraries.** Git repos,
+  `node_modules`, app bundles, your Photos library and similar are skipped whole.
+- **Reorganize folders you already sorted.** Only *loose* files at the top of
+  each folder are touched.
+- **Move a file you're working on.** Anything modified in the last 24 hours, or
+  open in another program, is left alone.
+- **Download your cloud files.** OneDrive "online-only" and iCloud-only files
+  stay in the cloud; they're skipped rather than fetched.
 - **Let the AI decide to delete.** Only an exact byte-for-byte duplicate is ever
   deleted automatically, and the oldest copy is always kept.
 
@@ -35,13 +39,16 @@ tells you in the morning.
 
 ## What you need
 
-- **A Mac** (macOS only — it relies on launchd, Finder and the Trash)
+- **A Mac, or a Windows 11 PC**
 - **An AI key** — either or both, both are free:
   - **Gemini** (recommended): [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
   - **NVIDIA**: [build.nvidia.com](https://build.nvidia.com) → pick any model → *Get API Key*
-- **Telegram** (recommended) — you'll create your own private bot during setup; takes a minute
+- **Telegram** (recommended) — you'll create your own private bot during setup;
+  it takes a minute
 
 ## Install
+
+### Mac
 
 ```bash
 git clone https://github.com/Elshod09K/fily.git
@@ -49,8 +56,26 @@ cd fily
 ./install.sh
 ```
 
-Run this in the **Terminal** app. It installs everything into the `fily` folder
-and starts setup, which asks for:
+Run this in the **Terminal** app.
+
+### Windows
+
+```powershell
+git clone https://github.com/Elshod09K/fily.git
+cd fily
+.\install.cmd
+```
+
+No git? On GitHub click **Code → Download ZIP**, extract it, and **double-click
+`install.cmd`**. If Windows shows *"Windows protected your PC"*, click **More
+info → Run anyway** — that appears for any script downloaded from the internet.
+
+You need **Python 3.11 or newer**. If you don't have it, the installer tells
+you how; the quickest is `winget install Python.Python.3.13`.
+
+### Setup
+
+Either way, the installer then runs setup, which asks for:
 
 1. **Your AI key(s)** — each is tested with a real request, and it keeps only
    the models your key can actually use
@@ -58,13 +83,16 @@ and starts setup, which asks for:
 3. **Which folders** to organize — defaults to Downloads and Desktop
 4. **What time** to run each day — defaults to 22:00
 
-Then it schedules itself, checks macOS will let it see your folders, and gives
-you a link to connect your phone. **After that you can forget about it.**
+Then it schedules itself, checks it can work in your folders, and gives you a
+link to connect your phone. **After that you can forget about it.**
 
-> **One macOS permission step.** A background job can't see your Downloads
-> until you allow it. If setup says folders are hidden, it opens the right
-> Settings page and copies the path you need to your clipboard:
-> *System Settings → Privacy & Security → Full Disk Access → + → ⌘⇧G → paste.*
+> **One possible permission step.**
+> **Mac:** a background job can't see your Downloads until you allow it. Setup
+> opens the right page and copies the path you need: *System Settings → Privacy &
+> Security → Full Disk Access → + → ⌘⇧G → paste.*
+> **Windows:** only if *Controlled folder access* is switched on in Windows
+> Security (it's off by default). Setup detects it and shows which two programs
+> to allow.
 
 ## Using it
 
@@ -92,36 +120,46 @@ suggested folder:
 [ 🗑 Delete ]            [ ✖️ Stop ]
 ```
 
-**Show in Finder** highlights the file on your Mac. **Send me it** uploads that
-one file to the chat so you can open it on your phone.
+**Show in Finder** (or **File Explorer** on Windows) highlights the file on your
+computer. **Send me it** uploads that one file to the chat so you can open it
+on your phone.
+
+Folder names can be in any language — *Шартномалар* and *Oʻquv reja* work as
+well as *Contracts*.
 
 ### Duplicates
 
-Byte-identical copies are found locally and the spares go to the Trash — the
-oldest copy is kept, and both files are re-checked immediately before deleting.
-Prefer to decide yourself? Set `duplicates: {action: stage}` in `config.yaml`
-and they'll collect in a `_Duplicates/` folder instead.
+Byte-identical copies are found locally and the spares go to the Trash / Recycle
+Bin — the oldest copy is kept, and both files are re-checked immediately before
+deleting. Prefer to decide yourself? Set `duplicates: {action: stage}` in
+`config.yaml` and they'll collect in a `_Duplicates/` folder instead.
 
 ## Is it working?
 
-```bash
-.venv/bin/organize health
-```
+| Mac | Windows |
+|---|---|
+| `.venv/bin/organize health` | `.venv\Scripts\organize health` |
 
 or `/health` in Telegram. It checks the schedule is registered, a run actually
-succeeded recently, your folders are readable, and your last Telegram message
-was delivered. You don't need to check it routinely: if no run succeeds for 36
-hours, Fily messages you on its own.
+succeeded recently, your folders are readable, the bot is really reaching
+Telegram, and your last message was delivered. You don't need to check it
+routinely: if no run succeeds for 36 hours, Fily messages you on its own.
 
 ### On a laptop
 
-macOS runs nothing while it's asleep. A missed run isn't skipped — it happens
-next time you open the lid. To run on time even while asleep, schedule a wake a
-few minutes earlier (needs your password):
+A computer that's asleep runs nothing. A missed run isn't skipped, though — it
+happens as soon as the computer wakes.
 
-```bash
-sudo pmset repeat wakeorpoweron MTWRFSU 21:57:00
-```
+- **Windows** already asks to wake the PC for the daily run. On battery,
+  Windows often only honours "important" wake timers; to allow Fily's (optional):
+  ```powershell
+  powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP RTCWAKE 1
+  powercfg /setactive SCHEME_CURRENT
+  ```
+- **Mac**: schedule a wake a few minutes before the run (needs your password):
+  ```bash
+  sudo pmset repeat wakeorpoweron MTWRFSU 21:57:00
+  ```
 
 ## Privacy
 
@@ -132,21 +170,24 @@ sudo pmset repeat wakeorpoweron MTWRFSU 21:57:00
 | Anywhere else | nothing |
 
 Keys live in `.env` inside the folder, readable only by your user account.
-Duplicate detection happens entirely on your Mac.
+Duplicate detection happens entirely on your computer.
 
 ## Updating
 
 ```bash
-cd fily && git pull && ./install.sh
+git pull
+./install.sh        # Mac
+.\install.cmd       # Windows
 ```
 
-Your keys and settings are kept. To change them, run `./install.sh --setup`.
+Your keys and settings are kept. To change them: `./install.sh --setup` on a Mac,
+`.\install.cmd -Setup` on Windows.
 
 ## Uninstalling
 
-```bash
-.venv/bin/organize install --uninstall
-```
+| Mac | Windows |
+|---|---|
+| `.venv/bin/organize install --uninstall` | `.venv\Scripts\organize install --uninstall` |
 
 stops everything; then delete the `fily` folder. Files it already organized stay
 where they are.
@@ -155,11 +196,14 @@ where they are.
 
 | | |
 |---|---|
-| **Bot doesn't reply** | Run `.venv/bin/organize doctor` — it tests the connection and shows messages the bot isn't picking up. |
-| **Lost the pairing link / new phone** | `.venv/bin/organize bot --pair` (or `--unpair` to move to another account) |
-| **"macOS is blocking access"** | The Full Disk Access step above. |
-| **It stopped running** | `.venv/bin/organize install` re-arms the schedule. Run it from the Terminal app, not an editor's built-in terminal. |
+| **Bot doesn't reply** | Run `organize doctor` — it tests the connection and shows messages the bot isn't picking up. |
+| **Lost the pairing link / new phone** | `organize bot --pair` (or `--unpair` to move to another account) |
+| **"… is blocking access"** | The permission step above. |
+| **It stopped running** | `organize install` re-arms the schedule. On a Mac, run it from the Terminal app, not an editor's built-in terminal. |
+| **Windows: nothing happens on double-click** | Right-click `install.cmd` → *Properties* → tick *Unblock* → OK, then try again. |
 | **Wrong folder choices** | Review them; you can also raise `auto_confidence` in `config.yaml` so fewer files move without asking. |
+
+(`organize` means `.venv/bin/organize` on a Mac and `.venv\Scripts\organize` on Windows.)
 
 ## Configuration
 
@@ -169,9 +213,9 @@ any setting into your `config.yaml` to change it.
 
 ## Command line
 
-Everything the bot does is also available as `.venv/bin/organize <command>`:
-`setup`, `run` (`--dry-run` to preview), `review`, `undo`, `status`, `health`,
-`doctor`, `install`, `bot`, `prune`. Add `--help` to any of them.
+Everything the bot does is also available as `organize <command>`: `setup`,
+`run` (`--dry-run` to preview), `review`, `undo`, `status`, `health`, `doctor`,
+`install`, `bot`, `prune`. Add `--help` to any of them.
 
 ## How it works
 
@@ -188,7 +232,9 @@ AI can at worst produce an oddly named folder. See
 .venv/bin/python -m pytest
 ```
 
-Tests are hermetic: no network, no real Trash, no launchd.
+Tests are hermetic: no network, no real Trash, no scheduler changes. CI runs
+them on real Windows and macOS machines with Python 3.11 and 3.13, and on
+Windows also registers and runs real scheduled tasks.
 
 ## License
 

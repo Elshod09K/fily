@@ -12,13 +12,15 @@ good enough.
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import host
 from .hashing import content_id, verify_content
 
-TRASH = Path.home() / ".Trash"
+# macOS: ~/.Trash. Windows has no single readable folder for the Recycle
+# Bin, so there is nothing to read back and recovery goes through Explorer.
+TRASH: Path | None = host.TRASH_DIR
 
 
 class TrashError(RuntimeError):
@@ -33,6 +35,8 @@ def trash_readable() -> bool:
     read the directory back. That asymmetry decides whether `organize undo`
     can un-delete, or whether recovery has to go through Finder's Put Back.
     """
+    if TRASH is None:
+        return False
     try:
         next(iter(os.scandir(TRASH)), None)
         return True
@@ -51,7 +55,7 @@ class Trashed:
 
 def _snapshot() -> set[str]:
     try:
-        return {p.name for p in TRASH.iterdir()}
+        return {p.name for p in TRASH.iterdir()} if TRASH else set()
     except OSError:
         return set()
 
@@ -62,6 +66,8 @@ def _locate(before: set[str], name: str, sha: str, method: str) -> Path | None:
     It renames on collision ("report.pdf" -> "report 2.pdf"), so match on
     content rather than trusting the name.
     """
+    if TRASH is None:
+        return None
     try:
         candidates = [p for p in TRASH.iterdir() if p.name not in before]
     except OSError:
@@ -111,15 +117,14 @@ def restore(entry) -> tuple[bool, str]:
     if original.exists():
         return False, "something is already back at the original path"
     if not trash_readable():
-        return False, ("it is in the Trash — restore it with Finder \u2192 "
-                       "right-click \u2192 Put Back (this app cannot read the "
-                       "Trash without Full Disk Access)")
+        return False, (f"it is in the {host.TRASH_NAME} — restore it with "
+                       f"{host.RESTORE_HINT}")
 
     candidate = Path(entry.dst) if entry.dst else None
     if candidate is None or not candidate.exists():
         # The recorded path is gone; try to find it by content anyway.
         try:
-            pool = [p for p in TRASH.iterdir() if p.is_file()]
+            pool = [p for p in TRASH.iterdir() if p.is_file()] if TRASH else []
         except OSError:
             pool = []
         candidate = next(

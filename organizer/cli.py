@@ -22,6 +22,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import config as cfgmod
+from . import host
 from . import lock as runlock
 from . import applier, classify, dedupe, extract, health, journal, notify, planner, report, safety, scanner
 from .providers.base import AllProvidersFailed
@@ -79,10 +80,7 @@ def cmd_doctor(args) -> int:
         except PermissionError:
             ok = False
             console.print(f"  [red]DENIED[/red]  {r}")
-            console.print("          Grant Full Disk Access to:")
-            console.print(f"          [bold]{Path(sys.executable).resolve()}[/bold]")
-            console.print("          System Settings > Privacy & Security > "
-                          "Full Disk Access")
+            console.print("  " + host.access_fix(str(Path(sys.executable).resolve())))
         except OSError as e:
             console.print(f"  [yellow]warn[/yellow]    {r}: {e}")
 
@@ -272,6 +270,8 @@ def _run_locked(cfg, args) -> int:
 
     jr = journal.Journal(cfg, run_id)
     applied = applier.apply_moves(cfg, plan.auto + plan.duplicates, jr, dry_run=dry)
+    if applied.errors and not dry:
+        _report_blocked_writes(cfg, applied.errors)
 
     queue = cfg.state_dir / "review_queue.json"
     queue.write_text(json.dumps({
@@ -302,7 +302,7 @@ def _run_locked(cfg, args) -> int:
     else:
         bits = [f"[bold green]moved {applied.moved}[/bold green]"]
         if applied.trashed:
-            bits.append(f"[yellow]{applied.trashed} duplicate(s) to Trash "
+            bits.append(f"[yellow]{applied.trashed} duplicate(s) to {host.TRASH_NAME} "
                         f"({applied.trashed_bytes/1048576:.0f} MB)[/yellow]")
         bits.append(f"{len(plan.review)} waiting for review")
         if applied.failed:
@@ -318,9 +318,9 @@ def _run_locked(cfg, args) -> int:
         for folder, n in sorted(by_folder.items(), key=lambda x: -x[1])[:8]:
             lines.append(f"• {tg.escape(folder)}/ — {n}")
         if applied.trashed:
-            lines.append(f"🗑 {applied.trashed} duplicate(s) to Trash — "
+            lines.append(f"🗑 {applied.trashed} duplicate(s) to {host.TRASH_NAME} — "
                          f"{applied.trashed_bytes/1048576:.0f} MB "
-                         "<i>(Finder → Put Back to undo)</i>")
+                         f"<i>({tg.escape(host.RESTORE_HINT)} to undo)</i>")
         elif plan.duplicates:
             lines.append(f"• _Duplicates/ — {len(plan.duplicates)} "
                          "(nothing deleted)")
@@ -342,27 +342,43 @@ def _run_locked(cfg, args) -> int:
 # --------------------------------------------------------------------------- review
 
 def _report_unreadable(cfg, run_id: str, blocked, all_blocked: bool) -> None:
-    """Say loudly that macOS is hiding folders from us, and how to fix it."""
+    """Say loudly that the OS is hiding folders from us, and how to fix it."""
     from . import telegram as tg
-    interp = Path(sys.executable).resolve()
+    interp = str(Path(sys.executable).resolve())
     for root, why in blocked:
         console.print(f"[red]cannot read {root}: {why}[/red]")
-    console.print(f"Grant Full Disk Access to: [bold]{interp}[/bold]")
+    console.print(host.access_fix(interp))
 
     names = ", ".join(f"<code>{tg.escape(str(r).replace(str(Path.home()), '~'))}</code>"
                       for r, _ in blocked)
-    body = ["🔒 <b>macOS is blocking access to your folders</b>", "",
+    body = [f"🔒 <b>{host.NAME} is blocking access to your folders</b>", "",
             f"I could not read: {names}",
             "" if all_blocked else "The other folders were organized normally.",
-            "<b>Fix, once:</b> System Settings → Privacy &amp; Security → "
-            "<b>Full Disk Access</b> → <b>+</b> → press ⌘⇧G and paste:",
-            f"<code>{tg.escape(str(interp))}</code>",
+            *host.access_fix_html(interp, tg.escape),
             "", "Then tap /run to try again."]
-    summary = ("macOS is blocking access to "
+    summary = (f"{host.NAME} is blocking access to "
                + ("every folder" if all_blocked else f"{len(blocked)} folder(s)"))
     # Deliver now, not at the morning check: nothing else will fix itself.
-    notify.notify(cfg, summary, subtitle="Full Disk Access needed", sound=True,
-                  telegram_text="\n".join(l for l in body if l is not None))
+    notify.notify(cfg, summary, subtitle="folder access needed", sound=True,
+                  telegram_text="\n".join(body))
+
+
+def _report_blocked_writes(cfg, errors) -> None:
+    """On Windows, Controlled folder access lets Fily read but not move, so a
+    run "succeeds" with every move failed. Name the cause instead of leaving
+    a column of PermissionErrors."""
+    denied = [p for p, e in errors if "PermissionError" in e or "Access is denied" in e]
+    if not host.IS_WINDOWS or len(denied) < max(1, len(errors) // 2):
+        return
+    from . import telegram as tg
+    interp = str(Path(sys.executable).resolve())
+    console.print(host.access_fix(interp))
+    body = ["🔒 <b>Windows Security blocked Fily from moving files</b>", "",
+            f"{len(denied)} move(s) were refused. Nothing was lost.",
+            *host.access_fix_html(interp, tg.escape), "", "Then tap /run."]
+    notify.notify(cfg, "Windows Security blocked Fily's moves",
+                  subtitle="Controlled folder access", sound=True,
+                  telegram_text="\n".join(body))
 
 
 def cmd_review(args) -> int:
@@ -371,7 +387,7 @@ def cmd_review(args) -> int:
     if not queue.exists():
         console.print("nothing queued")
         return 0
-    data = json.loads(queue.read_text())
+    data = json.loads(queue.read_text(encoding="utf-8"))
     items = [i for i in data.get("items", []) if Path(i["path"]).exists()]
     if not items:
         console.print("nothing queued")
@@ -425,7 +441,8 @@ def cmd_review(args) -> int:
                 category=i.get("category", "manual"), confidence=1.0,
                 provider="manual"))
             trashed += 1
-            console.print("  [yellow]-> Trash[/yellow] (recoverable in Finder)")
+            console.print(f"  [yellow]-> {host.TRASH_NAME}[/yellow] "
+                          f"(recover: {host.RESTORE_HINT})")
             continue
         if ans.lower() == "s" or (not ans and not default):
             kept += 1
@@ -487,7 +504,7 @@ def cmd_undo(args) -> int:
     console.print(f"reversing {len(entries)} move(s) from run {target.stem}")
     res = applier.undo_run(cfg, target, dry_run=args.dry_run)
     verb = "would restore" if args.dry_run else "restored"
-    extra = f" ({res.untrashed} from the Trash)" if res.untrashed else ""
+    extra = f" ({res.untrashed} from the {host.TRASH_NAME})" if res.untrashed else ""
     console.print(f"[green]{verb} {res.restored}{extra}[/green], "
                   f"skipped {res.skipped}"
                   + (f", removed {res.dirs_removed} empty folder(s)"
@@ -518,10 +535,10 @@ def cmd_install(args) -> int:
     whoever calls it, so bootstrapping from a sandboxed or short-lived process
     produces jobs that vanish when that process does.
     """
-    from . import launchd
+    sched = host.scheduler()
 
     if args.uninstall:
-        removed = launchd.uninstall()
+        removed = sched.uninstall()
         for r in removed:
             console.print(f"  [yellow]removed {r}[/yellow]")
         console.print("\nScheduled jobs removed. Nothing will run automatically.")
@@ -529,13 +546,13 @@ def cmd_install(args) -> int:
 
     cfg = _load(args)
     from . import telegram as tg
-    jobs = launchd.JOBS if tg.configured() else tuple(
-        j for j in launchd.JOBS if j != "bot")
-    res = launchd.install(cfg, jobs)
+    jobs = sched.JOBS if tg.configured() else tuple(
+        j for j in sched.JOBS if j != "bot")
+    res = sched.install(cfg, jobs)
     for old in res.removed_legacy:
         console.print(f"  [dim]removed old job {old}[/dim]")
     for job in res.installed:
-        console.print(f"  [green]armed {launchd.label(job)}[/green]")
+        console.print(f"  [green]armed {sched.label(job)}[/green]")
     for line in res.failed:
         console.print(f"  [red]{line}[/red]")
     console.print()
@@ -591,13 +608,13 @@ def cmd_status(args) -> int:
 
     queue = cfg.state_dir / "review_queue.json"
     if queue.exists():
-        n = len(json.loads(queue.read_text()).get("items", []))
+        n = len(json.loads(queue.read_text(encoding="utf-8")).get("items", []))
         if n:
             console.print(f"\n{n} file(s) waiting: [bold]organize review[/bold]")
 
     pending = notify.alert_path(cfg)
     if pending.exists():
-        alerts = json.loads(pending.read_text()).get("alerts", [])
+        alerts = json.loads(pending.read_text(encoding="utf-8")).get("alerts", [])
         console.print(f"\n[red]{len(alerts)} undelivered failure alert(s)[/red]")
         for a in alerts[-3:]:
             console.print(f"  {a['when']} — {a['summary']}")
@@ -683,15 +700,15 @@ def cmd_prune(args) -> int:
         console.print(f"  ... and {len(targets)-20} more")
     if not args.yes:
         try:
-            if input("\nmove these to the Trash? [y/N] ").strip().lower() != "y":
+            if input(f"\nmove these to the {host.TRASH_NAME}? [y/N] ").strip().lower() != "y":
                 console.print("cancelled")
                 return 0
         except (EOFError, KeyboardInterrupt):
             return 0
     for p in targets:
         send2trash(str(p))
-    console.print(f"[green]moved {len(targets)} file(s) to the Trash[/green] "
-                  "(recoverable from Finder)")
+    console.print(f"[green]moved {len(targets)} file(s) to the {host.TRASH_NAME}"
+                  f"[/green] (recover: {host.RESTORE_HINT})")
     return 0
 
 
@@ -701,6 +718,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="organize", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", help="path to config.yaml")
+    p.add_argument("--log", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("doctor", help="check keys, providers, permissions, scope")
@@ -773,8 +791,38 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _redirect_output(path: str) -> None:
+    """Send all output to a log file.
+
+    Task Scheduler runs pythonw.exe, which has no console: sys.stdout is None
+    and the first print would crash the run. launchd redirects for us on a
+    Mac; on Windows the app does it itself.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(target, "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = fh
+
+
+def _tolerate_legacy_encodings() -> None:
+    """Piped output on Windows is encoded in the ANSI code page (cp1252 on
+    most machines), where "✓" doesn't exist; printing it would crash the
+    command. Replace what can't be encoded instead. Consoles are unaffected
+    (Python talks UTF-16 to them), and scheduled tasks use -X utf8 anyway."""
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if stream is not None and enc != "utf8" and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv=None) -> int:
+    _tolerate_legacy_encodings()
     args = build_parser().parse_args(argv)
+    if args.log:
+        _redirect_output(args.log)
     try:
         return args.func(args)
     except cfgmod.ConfigError as e:

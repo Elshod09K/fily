@@ -1,0 +1,8 @@
+# Shell scripts must keep LF or bash chokes on the \r.
+*.sh    text eol=lf
+# Windows scripts get CRLF: batch files misbehave with bare LF.
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf

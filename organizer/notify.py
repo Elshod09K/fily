@@ -6,19 +6,14 @@ pending_alert.json instead; the morning launchd job delivers it.
 from __future__ import annotations
 
 import json
-import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
 
-from . import telegram
+from . import host, telegram
 from .config import Config
 
 TITLE = "File Organizer"
-
-
-def _escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def delivery_log(cfg: Config) -> Path:
@@ -75,25 +70,17 @@ def notify(cfg: Config, message: str, subtitle: str = "", sound: bool = False,
            buttons: list[list[dict]] | None = None) -> bool:
     """Notify on the desktop and, when paired, in Telegram.
 
-    Both are attempted: the desktop banner is there when sitting at the Mac,
-    Telegram is there when not.
+    Both are attempted: the desktop banner is there when sitting at the
+    computer, Telegram is there when not.
     """
     if not cfg.notify_enabled:
         return False
     telegram_push(cfg, telegram_text or f"<b>{telegram.escape(message)}</b>"
                   + (f"\n{telegram.escape(subtitle)}" if subtitle else ""),
                   buttons)
-    script = (f'display notification "{_escape(message[:240])}" '
-              f'with title "{TITLE}"')
-    if subtitle:
-        script += f' subtitle "{_escape(subtitle[:120])}"'
-    if sound:
-        script += ' sound name "Submarine"'
     try:
-        subprocess.run(["/usr/bin/osascript", "-e", script],
-                       capture_output=True, timeout=15, check=False)
-        return True
-    except (OSError, subprocess.TimeoutExpired):
+        return host.notify_desktop(TITLE, message, subtitle, sound)
+    except Exception:
         return False
 
 
@@ -108,7 +95,7 @@ def queue_alert(cfg: Config, run_id: str, summary: str, detail: dict) -> Path:
     existing = []
     if p.exists():
         try:
-            existing = json.loads(p.read_text()).get("alerts", [])
+            existing = json.loads(p.read_text(encoding="utf-8")).get("alerts", [])
         except (json.JSONDecodeError, OSError):
             existing = []
     existing.append({
@@ -116,7 +103,7 @@ def queue_alert(cfg: Config, run_id: str, summary: str, detail: dict) -> Path:
         "when": datetime.now().isoformat(timespec="seconds"),
         "summary": summary, "detail": detail,
     })
-    p.write_text(json.dumps({"alerts": existing[-20:]}, indent=2, ensure_ascii=False))
+    p.write_text(json.dumps({"alerts": existing[-20:]}, indent=2, ensure_ascii=False), encoding="utf-8")
     return p
 
 
@@ -126,7 +113,7 @@ def deliver_pending(cfg: Config) -> tuple[int, str]:
     if not p.exists():
         return 0, "nothing pending"
     try:
-        alerts = json.loads(p.read_text()).get("alerts", [])
+        alerts = json.loads(p.read_text(encoding="utf-8")).get("alerts", [])
     except (json.JSONDecodeError, OSError) as e:
         return 0, f"pending alert file unreadable: {e}"
     if not alerts:

@@ -6,6 +6,7 @@ Run with:  .venv/bin/python -m pytest tests/ -q
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -61,10 +62,18 @@ def test_destination_must_be_inside_an_allowed_root(tmp_path):
     assert dest is None and "outside" in why
 
 
+def _symlink_or_skip(link, target, is_dir=False):
+    try:
+        link.symlink_to(target, target_is_directory=is_dir)
+    except OSError:
+        pytest.skip("this account can't create symlinks (Windows without "
+                    "Developer Mode)")
+
+
 def test_symlinked_folder_cannot_smuggle_a_write_outside(tmp_path):
     root, outside = tmp_path / "Downloads", tmp_path / "Outside"
     root.mkdir(); outside.mkdir()
-    (root / "escape").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(root / "escape", outside, is_dir=True)
     dest, why = safety.resolve_destination(root, "escape", "x.pdf", (root,))
     assert dest is None, f"symlink escaped: {dest}"
 
@@ -99,10 +108,20 @@ def test_home_itself_is_not_scannable():
     assert safety.root_rejection_reason(Path.home()) is not None
 
 
-@pytest.mark.parametrize("p", ["Library", "Pictures", "Movies", "Music", ".Trash"])
+PROTECTED = (["AppData", "Pictures", "Music"] if sys.platform == "win32"
+             else ["Library", "Pictures", "Movies", "Music", ".Trash"])
+
+
+@pytest.mark.parametrize("p", PROTECTED)
 def test_protected_roots_refused(p):
-    why = safety.root_rejection_reason(Path.home() / p)
+    from organizer import host
+    root = (host.known_folder(p) if p in ("Pictures", "Music") else Path.home() / p)
+    why = safety.root_rejection_reason(root)
     assert why is not None, f"{p} should not be scannable"
+
+
+def test_a_whole_drive_is_refused():
+    assert safety.root_rejection_reason(Path(Path.home().anchor)) is not None
 
 
 def test_downloads_is_scannable():
@@ -141,7 +160,7 @@ def test_hardlink_is_skipped(tmp_path):
 def test_symlink_is_skipped(tmp_path):
     real, link = tmp_path / "real.pdf", tmp_path / "link.pdf"
     real.write_text("x")
-    link.symlink_to(real)
+    _symlink_or_skip(link, real)
     assert safety.skip_reason(link, link.lstat(), 0) == "symlink"
 
 
@@ -174,3 +193,44 @@ def test_collisions_never_overwrite(tmp_path):
 def test_free_name_is_returned_unchanged(tmp_path):
     f = tmp_path / "fresh.pdf"
     assert safety.unique_destination(f) == f
+
+
+# ------------------------------------------------------- non-English folders
+
+@pytest.mark.parametrize("name", [
+    "Шартномалар", "Oʻquv reja", "Dissertatsiya/2026", "Études", "文档",
+])
+def test_folders_in_any_language_are_allowed(name):
+    ok, cleaned = safety.validate_relative_folder(name)
+    assert ok, cleaned
+
+
+@pytest.mark.parametrize("name,why", [
+    ("a∕b", "division slash that looks like /"),
+    ("a／b", "fullwidth slash"),
+    ("invoice‮fdp.exe", "right-to-left override that disguises a name"),
+    ("a​b", "zero-width space"),
+    ("a b", "no-break space inside a name"),
+    ("a\tb", "tab"),
+    ("Con", "reserved device name on Windows"),
+    ("LPT1.backup", "reserved device name with an extension"),
+])
+def test_unicode_tricks_are_rejected(name, why):
+    ok, _ = safety.validate_relative_folder(name)
+    assert not ok, why
+
+
+def test_one_canonical_spelling():
+    """'é' precomposed and 'e' + combining accent must be the same folder."""
+    composed = safety.validate_relative_folder("Café")[1]
+    decomposed = safety.validate_relative_folder("Café")[1]
+    assert composed == decomposed
+
+
+@pytest.mark.parametrize("name", ["Desktop App.lnk", "site.url", "tool.appref-ms"])
+def test_shortcuts_are_left_alone(tmp_path, name):
+    f = tmp_path / name
+    f.write_text("x")
+    old = time.time() - 72 * 3600
+    os.utime(f, (old, old))
+    assert safety.skip_reason(f, f.lstat(), 24) == "shortcut"
