@@ -25,12 +25,15 @@ class DuplicateGroup:
 
 
 def _canonical_of(records: list[FileRecord]) -> FileRecord:
-    """Keep the oldest copy; break ties on the shortest, plainest name.
+    """Which copy to keep.
 
-    The original download almost always predates its ' (1)' sibling, and the
-    shorter name is almost always the un-suffixed one.
+    A copy already filed inside a folder beats a loose one — deleting the
+    loose spare tidies things; deleting the filed one would undo work. Then
+    the oldest (the original download almost always predates its ' (1)'
+    sibling), then the shortest, plainest name.
     """
-    return sorted(records, key=lambda r: (r.mtime, len(r.name), r.name))[0]
+    return sorted(records, key=lambda r: (r.depth == 0, r.mtime, len(r.name),
+                                          r.name))[0]
 
 
 def find_duplicates(records: list[FileRecord]) -> tuple[list[DuplicateGroup], dict[int, str]]:
@@ -79,11 +82,22 @@ def find_duplicates(records: list[FileRecord]) -> tuple[list[DuplicateGroup], di
     return groups, hashes
 
 
-def ensure_hashes(records: list[FileRecord], max_bytes: int = 256 * 1024 * 1024) -> None:
-    """Fill in sha256 for cache lookups, skipping very large unhashed files."""
+def ensure_hashes(records: list[FileRecord], max_bytes: int = 256 * 1024 * 1024,
+                  cache=None) -> None:
+    """Fill in sha256 for every record.
+
+    With a cache, an unchanged file (same path, size and modification time)
+    reuses its stored hash, so a nightly scan of every subfolder doesn't
+    re-read every file.
+    """
     for r in records:
         if r.sha256:
             continue
+        if cache is not None:
+            known = cache.cached_hash(str(r.path), r.size, r.mtime)
+            if known:
+                r.sha256 = known
+                continue
         if r.size > max_bytes:
             # Stable stand-in so the cache still works for huge files.
             r.sha256 = f"size:{r.size}:{quick_signature(r.path, r.size)}"
@@ -92,3 +106,7 @@ def ensure_hashes(records: list[FileRecord], max_bytes: int = 256 * 1024 * 1024)
             r.sha256 = sha256_file(r.path)
         except OSError:
             r.sha256 = None
+        if cache is not None and r.sha256:
+            cache.remember_hash(str(r.path), r.size, r.mtime, r.sha256)
+    if cache is not None:
+        cache.commit()

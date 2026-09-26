@@ -99,6 +99,45 @@ CREATE TABLE IF NOT EXISTS decisions (
     provider    TEXT,
     decided_at  REAL NOT NULL
 );
+-- Where Fily (or you, through review) put each file. A placed file is
+-- never re-sorted: that is what keeps folders stable night after night.
+CREATE TABLE IF NOT EXISTS placements (
+    sha256      TEXT PRIMARY KEY,
+    path        TEXT NOT NULL,
+    placed_at   REAL NOT NULL
+);
+-- Folders Fily created. They are organizing folders, so it may look inside.
+CREATE TABLE IF NOT EXISTS fily_dirs (
+    path        TEXT PRIMARY KEY,
+    created_at  REAL NOT NULL
+);
+-- Whole folders Fily moved as a set. They stay where they were put.
+CREATE TABLE IF NOT EXISTS placed_dirs (
+    path        TEXT PRIMARY KEY,
+    placed_at   REAL NOT NULL
+);
+-- How each folder was judged ("set" or "open"), keyed by its contents, so
+-- an unchanged folder is never asked about twice.
+CREATE TABLE IF NOT EXISTS folder_decisions (
+    fingerprint TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    category    TEXT,
+    folder      TEXT,
+    confidence  REAL,
+    reason      TEXT,
+    decided_at  REAL NOT NULL
+);
+-- path + size + mtime -> sha256, so unchanged files aren't re-hashed nightly.
+CREATE TABLE IF NOT EXISTS file_hashes (
+    path        TEXT PRIMARY KEY,
+    size        INTEGER NOT NULL,
+    mtime       REAL NOT NULL,
+    sha256      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key         TEXT PRIMARY KEY,
+    value       TEXT
+);
 CREATE TABLE IF NOT EXISTS runs (
     run_id      TEXT PRIMARY KEY,
     started_at  REAL,
@@ -163,5 +202,111 @@ class Cache:
                 "moved", "queued", "detail"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
+    # ------------------------------------------------------- placements
+
+    def place(self, sha: str, path: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO placements VALUES (?,?,?)",
+                        (sha, path, time.time()))
+
+    def unplace(self, sha: str) -> None:
+        self.db.execute("DELETE FROM placements WHERE sha256 = ?", (sha,))
+
+    def placed_shas(self) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT sha256 FROM placements")}
+
+    def placements(self) -> dict[str, str]:
+        """sha256 -> where it was placed."""
+        return dict(self.db.execute("SELECT sha256, path FROM placements"))
+
+    def add_fily_dirs(self, paths) -> None:
+        self.db.executemany("INSERT OR IGNORE INTO fily_dirs VALUES (?,?)",
+                            [(p, time.time()) for p in paths])
+
+    def fily_dirs(self) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT path FROM fily_dirs")}
+
+    def place_dir(self, path: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO placed_dirs VALUES (?,?)",
+                        (path, time.time()))
+
+    def unplace_dir(self, path: str) -> None:
+        self.db.execute("DELETE FROM placed_dirs WHERE path = ?", (path,))
+
+    def placed_dirs(self) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT path FROM placed_dirs")}
+
+    def record_journal(self, path: Path) -> None:
+        """Fold a journal's moves into what Fily remembers."""
+        for e in read_journal(path):
+            action = e.action or "move"
+            if action == "move" and e.sha256:
+                self.place(e.sha256, e.dst)
+                self.add_fily_dirs(e.created_dirs or [])
+            elif action == "move_dir":
+                self.place_dir(e.dst)
+                self.add_fily_dirs(e.created_dirs or [])
+            elif action == "trash" and e.sha256:
+                self.unplace(e.sha256)
+        self.db.commit()
+
+    def forget_journal(self, path: Path) -> None:
+        """After an undo: those files and folders are unsorted again."""
+        for e in read_journal(path):
+            action = e.action or "move"
+            if action == "move" and e.sha256:
+                self.unplace(e.sha256)
+            elif action == "move_dir":
+                self.unplace_dir(e.dst)
+        self.db.commit()
+
+    def backfill(self, cfg: Config) -> int:
+        """Learn placements from journals written before this table existed.
+        Runs once; later journals are recorded as they are written."""
+        done = self.db.execute(
+            "SELECT value FROM meta WHERE key = 'placements_backfilled'").fetchone()
+        if done:
+            return 0
+        n = 0
+        for j in Journal.list_runs(cfg):           # *.jsonl only: undone runs
+            self.record_journal(j)                 # are renamed .jsonl.undone
+            n += 1
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('placements_backfilled', ?)",
+                        (str(time.time()),))
+        self.db.commit()
+        return n
+
+    # ------------------------------------------------------ folder decisions
+
+    def folder_get(self, fingerprint: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT kind, category, folder, confidence, reason FROM folder_decisions "
+            "WHERE fingerprint = ?", (fingerprint,)).fetchone()
+        if not row:
+            return None
+        return dict(zip(["kind", "category", "folder", "confidence", "reason"], row))
+
+    def folder_put(self, fingerprint: str, d: dict) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO folder_decisions VALUES (?,?,?,?,?,?,?)",
+            (fingerprint, d.get("kind", "set"), d.get("category"), d.get("folder"),
+             float(d.get("confidence", 0.0)), d.get("reason"), time.time()))
+        self.db.commit()
+
+    # ------------------------------------------------------------ hash cache
+
+    def cached_hash(self, path: str, size: int, mtime: float) -> str | None:
+        row = self.db.execute(
+            "SELECT sha256 FROM file_hashes WHERE path = ? AND size = ? AND mtime = ?",
+            (path, size, mtime)).fetchone()
+        return row[0] if row else None
+
+    def remember_hash(self, path: str, size: int, mtime: float, sha: str) -> None:
+        self.db.execute("INSERT OR REPLACE INTO file_hashes VALUES (?,?,?,?)",
+                        (path, size, mtime, sha))
+
+    def commit(self) -> None:
+        self.db.commit()
+
     def close(self) -> None:
+        self.db.commit()
         self.db.close()

@@ -83,6 +83,19 @@ def is_file_open(path: Path) -> bool:
         return False
 
 
+def folder_in_use(path: Path) -> bool:
+    """Is any file under `path` open in another process? One lsof pass over
+    the whole tree; a timeout counts as "in use", so nothing busy is moved."""
+    try:
+        r = subprocess.run(["/usr/sbin/lsof", "-t", "+D", str(path)],
+                           capture_output=True, timeout=30, check=False)
+        return bool(r.stdout.strip())
+    except subprocess.TimeoutExpired:
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)          # signal 0: existence check, sends nothing

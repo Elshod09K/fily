@@ -1,8 +1,8 @@
 # Fily
 
-**A private file organizer for your Mac or Windows PC.** Every night it looks
-at the loose files piling up in your Downloads (and any other folders you
-choose), works out what each one is, and files it into a sensible folder —
+**A private file organizer for your Mac or Windows PC.** Every night it goes
+through your Downloads (and any other folders you choose), subfolders
+included, works out what each file is, and files it into a sensible folder —
 then messages you on Telegram with what it did.
 
 It runs on your own computer with your own free AI key. Nothing is uploaded to
@@ -25,8 +25,12 @@ a server you don't control, and it never erases anything.
   you can always put it back.
 - **Touch code projects, apps, or photo/music libraries.** Git repos,
   `node_modules`, app bundles, your Photos library and similar are skipped whole.
-- **Reorganize folders you already sorted.** Only *loose* files at the top of
-  each folder are touched.
+- **Split up folders that belong together.** An extracted download, an exam
+  pack, a project or a month's worth of documents is moved as one piece or
+  not at all.
+- **Re-shuffle what's already sorted.** Anything Fily placed, or you placed
+  through review, stays where it is — a second run over the same folders
+  moves nothing.
 - **Move a file you're working on.** Anything modified in the last 24 hours, or
   open in another program, is left alone.
 - **Download your cloud files.** OneDrive "online-only" and iCloud-only files
@@ -127,11 +131,30 @@ on your phone.
 Folder names can be in any language — *Шартномалар* and *Oʻquv reja* work as
 well as *Contracts*.
 
+### Subfolders
+
+Fily looks inside subfolders too, but it first judges each folder as a whole:
+
+| | |
+|---|---|
+| **A set** — the files belong together (`Q1-2026 exam pack/`, `sentabr 2026/`, a project) | moved as one piece, or left where it is; never split |
+| **A category** — one kind of thing (`SAT Prep/`, `Invoices/`) | files that fit stay; misplaced ones move, but only when Fily is nearly certain |
+| **A dump** — a catch-all (`files/`, `New folder/`) | its contents are sorted out; nothing new is ever put into it |
+
+Code projects, app bundles and photo/music libraries are never touched. When
+Fily isn't sure what a folder is, it keeps it together. A folder waiting for
+your decision shows up in `/review` with its files listed, so you can move it
+as a whole or leave it.
+
+Prefer the old behaviour (only loose files at the top)? Set `scan_depth: 1`
+under `behaviour:` in `config.yaml`.
+
 ### Duplicates
 
 Byte-identical copies are found locally and the spares go to the Trash / Recycle
-Bin — the oldest copy is kept, and both files are re-checked immediately before
-deleting. Prefer to decide yourself? Set `duplicates: {action: stage}` in
+Bin. A copy already filed in a folder is kept over a loose one; otherwise the
+oldest is kept. Both files are re-checked immediately before deleting, and
+nothing inside a set is ever deleted as a duplicate. Prefer to decide yourself? Set `duplicates: {action: stage}` in
 `config.yaml` and they'll collect in a `_Duplicates/` folder instead.
 
 ## Is it working?

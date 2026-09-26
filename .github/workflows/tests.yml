@@ -51,6 +51,13 @@ jobs:
             | head -9 | while IFS= read -r line; do echo "::notice title=pytest::${line}"; done
           grep -E "^SKIPPED" pytest-output.txt | head -9 \
             | while IFS= read -r line; do echo "::notice title=skipped::${line}"; done
+          # Failures and setup errors, with their one-line reason. (The
+          # annotation plugin reports failed assertions but not errors raised
+          # while setting a test up.)
+          grep -E "^(FAILED|ERROR) " pytest-output.txt | head -20 \
+            | while IFS= read -r line; do echo "::error title=pytest::${line}"; done
+          grep -E "^E   " pytest-output.txt | head -20 \
+            | while IFS= read -r line; do echo "::error title=detail::${line}"; done
           true
 
   installer:

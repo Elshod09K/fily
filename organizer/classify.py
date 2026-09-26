@@ -64,6 +64,11 @@ Rules for `folder`:
     one piece of work belong together even when their types differ.
   * Keep it shallow. Two segments is usually right; three is the maximum.
 
+Files already inside a subfolder show it as `in:`. If that folder fits the
+file, return exactly that folder, so it stays where it is. Only propose a
+different folder when the current one is clearly wrong, or is a generic dump
+("files", "New folder", "misc").
+
 Rules for `confidence`:
   * Be honest. Anything below 0.85 is held back for human review, which is the
     correct outcome for a genuinely ambiguous file. Do not inflate.
@@ -102,6 +107,7 @@ def render_file_block(r: FileRecord, snippet_chars: int) -> str:
     lines = [
         f"<file id=\"{r.file_id}\">",
         f"name: {r.name}",
+        f"in: {r.folder_rel + '/' if r.folder_rel else '(top level)'}",
         f"type: {kind} (.{r.ext or 'none'})",
         f"size: {_human_size(r.size)}",
         f"modified: {datetime.fromtimestamp(r.mtime):%Y-%m-%d}",

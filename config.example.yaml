@@ -4,8 +4,12 @@
 # only needs the settings you want to change; everything else is taken from
 # here. Hard safety rules live in organizer/safety.py and can't be overridden.
 
-# Folders to tidy. Only loose files at the top level are touched: anything
-# already inside a subfolder is considered organized and left alone.
+# Folders to tidy — including everything inside their subfolders.
+#   * Each subfolder is judged as a whole first. A *set* (an extracted
+#     download, an exam pack, a project, one month's documents) is filed as
+#     one piece and never split. Other folders are looked inside.
+#   * Anything Fily already placed, or you placed through review, stays put.
+#   * Code projects, app bundles and photo/music libraries are never touched.
 scan_roots:
   - ~/Downloads
   - ~/Desktop
@@ -27,7 +31,8 @@ media_destinations:
 deny_paths: []
 
 behaviour:
-  scan_depth: 1               # only loose files at the top of each folder
+  scan_depth: 0               # 0 = every level of subfolders;
+                              # 1 = only loose files at the top
   quarantine_hours: 24        # skip files touched more recently than this
   max_moves_per_run: 150      # exceeded -> apply nothing, queue everything
   run_budget_seconds: 900     # hard wall clock for a whole run

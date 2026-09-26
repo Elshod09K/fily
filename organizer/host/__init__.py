@@ -32,6 +32,7 @@ hidden = _impl.hidden
 cloud_only = _impl.cloud_only
 is_link_dir = _impl.is_link_dir
 is_file_open = _impl.is_file_open
+folder_in_use = _impl.folder_in_use
 pid_alive = _impl.pid_alive
 run_with_timeout = _impl.run_with_timeout
 restrict_to_owner = _impl.restrict_to_owner

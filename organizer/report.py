@@ -32,12 +32,19 @@ def write_report(cfg: Config, run_id: str, scan: ScanResult, plan: Plan,
     L.append("")
     L.append("| | |")
     L.append("|---|---|")
-    L.append(f"| Scanned | {len(scan.files)} loose files |")
+    L.append(f"| Scanned | {len(scan.files)} files"
+             + (f" in {len(scan.folders)} subfolders" if scan.folders else "") + " |")
     L.append(f"| Moved | {applied.moved if applied else 0} |")
+    if applied and applied.folders_moved:
+        L.append(f"| Folders moved as a whole | {applied.folders_moved} |")
+    if plan.stayed:
+        L.append(f"| Already in place | {plan.stayed} |")
+    if plan.kept_sets or plan.folder_moves:
+        L.append(f"| Folders kept together | {len(plan.kept_sets) + len(plan.folder_moves)} |")
     if applied and applied.trashed:
         L.append(f"| Deleted to Trash | {applied.trashed} "
                  f"({_size(applied.trashed_bytes)}) |")
-    L.append(f"| Queued for review | {len(plan.review)} |")
+    L.append(f"| Queued for review | {plan.review_count} |")
     L.append(f"| Skipped | {len(scan.skipped)} |")
     if applied and applied.failed:
         L.append(f"| Failed | {applied.failed} |")
@@ -62,6 +69,28 @@ def write_report(cfg: Config, run_id: str, scan: ScanResult, plan: Plan,
                          f"*(conf {m.confidence:.2f})*")
             L.append("")
 
+    if plan.folder_moves:
+        L.append(f"## Folders moved as a whole ({len(plan.folder_moves)})")
+        L.append("")
+        L.append("Each of these was judged a set whose files belong together, so "
+                 "it moved as one piece; nothing inside was split up.")
+        L.append("")
+        for fm in plan.folder_moves:
+            L.append(f"- `{fm.folder.rel}/` ({fm.folder.file_count} files) → "
+                     f"`{fm.target or '(top level)'}/` — {fm.reason} "
+                     f"*(conf {fm.confidence:.2f})*")
+        L.append("")
+
+    if plan.kept_sets:
+        L.append(f"<details><summary>Kept together where they are "
+                 f"({len(plan.kept_sets)})</summary>")
+        L.append("")
+        for f in plan.kept_sets:
+            L.append(f"- `{f.rel}/` ({f.file_count} files)")
+        L.append("")
+        L.append("</details>")
+        L.append("")
+
     if plan.duplicates:
         total = sum(m.record.size for m in plan.duplicates)
         deleted = any(m.delete for m in plan.duplicates)
@@ -80,11 +109,16 @@ def write_report(cfg: Config, run_id: str, scan: ScanResult, plan: Plan,
             L.append(f"- `{m.record.name}` ({_size(m.record.size)}) — {m.reason}")
         L.append("")
 
-    if plan.review:
-        L.append(f"## Waiting for review ({len(plan.review)})")
+    if plan.review or plan.folder_review:
+        L.append(f"## Waiting for review ({plan.review_count})")
         L.append("")
-        L.append("Run `organize review` to decide on these.")
+        L.append("Run `organize review`, or /review in Telegram, to decide on these.")
         L.append("")
+        for df in plan.folder_review:
+            line = f"- 📁 `{df.folder.rel}/` ({df.folder.file_count} files) — {df.why}"
+            if df.suggestion:
+                line += f" → suggested `{df.suggestion}`"
+            L.append(line)
         for d in sorted(plan.review, key=lambda x: x.record.name.lower()):
             bits = [f"- `{d.record.name}` — {d.why}"]
             if d.suggestion:

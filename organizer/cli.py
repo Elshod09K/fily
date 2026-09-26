@@ -24,7 +24,7 @@ from rich.table import Table
 from . import config as cfgmod
 from . import host
 from . import lock as runlock
-from . import applier, classify, dedupe, extract, health, journal, notify, planner, report, safety, scanner
+from . import applier, classify, dedupe, extract, health, journal, notify, planner, report, safety, scanner, triage
 from .providers.base import AllProvidersFailed
 
 console = Console()
@@ -60,8 +60,11 @@ def cmd_doctor(args) -> int:
     console.print("[bold]Configuration[/bold]")
     console.print(f"  config     {cfg.path}")
     console.print(f"  state      {cfg.state_dir}")
-    console.print(f"  scan depth {cfg.behaviour.scan_depth} "
-                  "(loose files only; existing subfolders left intact)")
+    depth = cfg.behaviour.scan_depth
+    console.print(f"  scan depth {depth} ("
+                  + ("loose files at the top only" if depth == 1 else
+                     "every level; each subfolder judged as a whole first" if depth == 0
+                     else f"up to {depth} levels deep") + ")")
     console.print("  roots:")
     for r in cfg.scan_roots:
         console.print(f"    {r}")
@@ -167,7 +170,8 @@ def cmd_doctor(args) -> int:
 
     console.print("\n[bold]Scope[/bold]")
     res = scanner.scan(cfg)
-    console.print(f"  {len(res.files)} loose files eligible")
+    console.print(f"  {len(res.files)} files eligible"
+                  + (f", in {len(res.folders)} subfolders" if res.folders else ""))
     console.print(f"  {len(res.skipped)} skipped (quarantine, hidden, transient)")
     console.print(f"  {len(res.pruned_dirs)} directories left intact")
 
@@ -192,6 +196,25 @@ def cmd_run(args) -> int:
         return 5
 
 
+def _classification_failed(cfg, cache, run_id: str, e, n_files: int) -> int:
+    summary = "classification failed on every provider; no files were moved"
+    detail = {
+        "error": str(e),
+        "attempts": [
+            {"provider": a.provider, "model": a.model, "attempt": a.attempt,
+             "error": a.error_type, "message": a.message} for a in e.attempts
+        ],
+        "files_untouched": n_files,
+    }
+    notify.queue_alert(cfg, run_id, summary, detail)
+    cache.finish_run(run_id, "failed", 0, 0, str(e)[:500])
+    cache.close()
+    console.print(f"[red]{summary}[/red]")
+    console.print(f"[dim]{e}[/dim]")
+    console.print("An alert is queued and will be delivered by the morning job.")
+    return 3
+
+
 def _run_locked(cfg, args) -> int:
     started = time.monotonic()
     run_id = journal.new_run_id()
@@ -209,18 +232,55 @@ def _run_locked(cfg, args) -> int:
             cache.finish_run(run_id, "failed", 0, 0, "no scan root readable")
             cache.close()
             return 6
-    _log(f"scanned {len(res.files)} loose files "
-         f"({len(res.skipped)} skipped, {len(res.pruned_dirs)} dirs left intact)")
-    if not res.files:
+    recursive = cfg.behaviour.scan_depth != 1
+    _log(f"scanned {len(res.files)} files"
+         + (f" across {len(res.folders)} subfolders" if recursive else " (top level only)")
+         + f" ({len(res.skipped)} skipped, {len(res.pruned_dirs)} dirs left intact)")
+    if not res.files and not res.folders:
         _log("nothing to organise")
         return 0
 
     cache = journal.Cache(cfg)
+    cache.backfill(cfg)
     cache.start_run(run_id, len(res.files))
 
-    _log("hashing and looking for exact duplicates...")
-    groups, _ = dedupe.find_duplicates(res.files)
-    dedupe.ensure_hashes(res.files)
+    _log("hashing...")
+    dedupe.ensure_hashes(res.files, cache=cache)
+
+    # Judge every subfolder as a whole first: a set is kept together (and
+    # nothing inside it is examined); an open folder is looked into.
+    verdicts, triage_attempts = {}, []
+    if recursive and res.folders:
+        _log("judging folders...")
+        try:
+            verdicts, triage_attempts = triage.triage(
+                cfg, res.folders, cache, res.existing_folders, log=_log)
+        except AllProvidersFailed as e:
+            return _classification_failed(cfg, cache, run_id, e, len(res.files))
+        n_sets = sum(1 for v in verdicts.values() if v.kind == "set")
+        _log(f"  {n_sets} kept together as sets, "
+             f"{len(verdicts) - n_sets} open for sorting")
+
+    # Which files still need a decision. Files inside a set belong to it.
+    # A file Fily (or you, through review) already placed stays put — also
+    # if you moved it yourself afterwards. Only a loose copy of a placed
+    # file is looked at again, so it can be caught as a duplicate.
+    placed = cache.placements()
+    pool: list = []          # everything duplicates are checked across
+    candidates: list = []    # everything that gets a sorting decision
+    stayed_placed = 0
+    for r in res.files:
+        if r.depth > 0 and triage.inside_set(r.path, r.root, verdicts):
+            continue
+        pool.append(r)
+        where = placed.get(r.sha256) if r.sha256 else None
+        if where is not None and (where == str(r.path) or r.depth > 0):
+            stayed_placed += 1
+            continue
+        candidates.append(r)
+
+    _log("looking for exact duplicates...")
+    groups, _ = dedupe.find_duplicates(pool)
     if groups:
         wasted = sum(g.wasted_bytes for g in groups)
         _log(f"  {len(groups)} duplicate group(s), "
@@ -228,7 +288,16 @@ def _run_locked(cfg, args) -> int:
              f"({wasted/1048576:.0f} MB)")
 
     dup_ids = {d.file_id for g in groups for d in g.duplicates}
-    to_classify = [r for r in res.files if r.file_id not in dup_ids]
+    to_classify = [r for r in candidates if r.file_id not in dup_ids]
+    # Offer existing folders as destinations — a set's top is fine, but
+    # never anything inside a set.
+    set_roots = [p for p, v in verdicts.items() if v.kind == "set"]
+    dumps = {p for p, v in verdicts.items() if v.dump}
+    existing = {
+        root: [f for f in names
+               if not any(s in (root / f).parents for s in set_roots)
+               and (root / f) not in dumps]
+        for root, names in res.existing_folders.items()}
 
     _log("extracting text...")
     for r in to_classify:
@@ -238,45 +307,51 @@ def _run_locked(cfg, args) -> int:
     try:
         deadline = started + cfg.behaviour.run_budget_seconds
         decisions, attempts = classify.classify(
-            cfg, to_classify, res.existing_folders, cache=cache, log=_log,
+            cfg, to_classify, existing, cache=cache, log=_log,
             deadline=deadline)
     except AllProvidersFailed as e:
-        summary = "classification failed on every provider; no files were moved"
-        detail = {
-            "error": str(e),
-            "attempts": [
-                {"provider": a.provider, "model": a.model, "attempt": a.attempt,
-                 "error": a.error_type, "message": a.message} for a in e.attempts
-            ],
-            "files_untouched": len(res.files),
-        }
-        notify.queue_alert(cfg, run_id, summary, detail)
-        cache.finish_run(run_id, "failed", 0, 0, str(e)[:500])
-        cache.close()
-        console.print(f"[red]{summary}[/red]")
-        console.print(f"[dim]{e}[/dim]")
-        console.print("An alert is queued and will be delivered by the morning job.")
-        return 3
+        return _classification_failed(cfg, cache, run_id, e, len(res.files))
+    attempts = triage_attempts + attempts
 
     unclassified = [r for r in to_classify if r.file_id not in decisions]
     if unclassified:
         _log(f"  {len(unclassified)} file(s) left unclassified -> review")
 
-    plan = planner.build_plan(cfg, res.files, decisions, groups)
-    _log(f"plan: {len(plan.auto)} auto, {len(plan.duplicates)} duplicates, "
-         f"{len(plan.review)} for review")
+    plan = planner.build_plan(cfg, candidates, decisions, groups,
+                              folders=res.folders, verdicts=verdicts)
+    plan.stayed += stayed_placed
+    _log(f"plan: {len(plan.folder_moves)} folder(s) as a whole, {len(plan.auto)} "
+         f"file(s), {len(plan.duplicates)} duplicates, {plan.review_count} for "
+         f"review, {plan.stayed} already in place")
     for n in plan.notes:
         console.print(f"[yellow]{n}[/yellow]")
 
     jr = journal.Journal(cfg, run_id)
-    applied = applier.apply_moves(cfg, plan.auto + plan.duplicates, jr, dry_run=dry)
+    # Whole folders first, so a file headed into a moved set lands inside it.
+    fres = applier.apply_folder_moves(cfg, plan.folder_moves, jr, dry_run=dry)
+    stuck = [fm.dest for fm in plan.folder_moves
+             if not dry and fm.folder.path.exists() and not fm.dest.exists()]
+    file_moves = [m for m in plan.auto
+                  if not any(m.dest == d or d in m.dest.parents for d in stuck)]
+    applied = applier.apply_moves(cfg, file_moves + plan.duplicates, jr, dry_run=dry)
+    applied.folders_moved = fres.folders_moved
+    applied.failed += fres.failed
+    applied.errors = fres.errors + applied.errors
     if applied.errors and not dry:
         _report_blocked_writes(cfg, applied.errors)
+    if not dry:
+        cache.record_journal(jr.path)
 
     queue = cfg.state_dir / "review_queue.json"
     queue.write_text(json.dumps({
         "run_id": run_id,
         "items": [{
+            "type": "folder", "path": str(df.folder.path), "root": str(df.folder.root),
+            "why": df.why, "suggestion": df.suggestion, "category": df.category,
+            "confidence": df.confidence, "file_count": df.folder.file_count,
+            "size": df.folder.total_size, "names": df.folder.files[:8],
+        } for df in plan.folder_review] + [{
+            "type": "file",
             "path": str(d.record.path), "root": str(d.record.root),
             "why": d.why, "suggestion": d.suggestion,
             "category": d.category, "confidence": d.confidence,
@@ -291,27 +366,38 @@ def _run_locked(cfg, args) -> int:
 
     rpt = report.write_report(cfg, run_id, res, plan, applied, dry, attempts, groups)
     cache.finish_run(run_id, "dry-run" if dry else "ok",
-                     applied.moved, len(plan.review))
+                     applied.moved + applied.folders_moved, plan.review_count)
     journal.Journal.prune(cfg)
     cache.close()
 
     console.print()
     if dry:
-        console.print(f"[bold]dry run:[/bold] {applied.moved} file(s) would move, "
-                      f"{len(plan.review)} would wait for review")
+        console.print(f"[bold]dry run:[/bold] {applied.folders_moved} folder(s) and "
+                      f"{applied.moved} file(s) would move, {plan.review_count} would "
+                      "wait for review")
     else:
         bits = [f"[bold green]moved {applied.moved}[/bold green]"]
+        if applied.folders_moved:
+            bits.append(f"[bold green]{applied.folders_moved} folder(s) as a whole"
+                        "[/bold green]")
         if applied.trashed:
             bits.append(f"[yellow]{applied.trashed} duplicate(s) to {host.TRASH_NAME} "
                         f"({applied.trashed_bytes/1048576:.0f} MB)[/yellow]")
-        bits.append(f"{len(plan.review)} waiting for review")
+        bits.append(f"{plan.review_count} waiting for review")
         if applied.failed:
             bits.append(f"[red]{applied.failed} failed[/red]")
         console.print(", ".join(bits))
-        if applied.moved or applied.trashed:
+        if applied.moved or applied.trashed or applied.folders_moved:
             console.print(f"undo with: [bold]organize undo {run_id}[/bold]")
         from . import telegram as tg
-        lines = [f"🗂 <b>Organized {applied.moved} file(s)</b>"]
+        lines = [f"🗂 <b>Organized {applied.moved} file(s)</b>"
+                 + (f" and <b>{applied.folders_moved}</b> folder(s)"
+                    if applied.folders_moved else "")]
+        for fm in plan.folder_moves[:5]:
+            if fm.dest.exists():
+                lines.append(f"📁 {tg.escape(fm.folder.name)} → "
+                             f"{tg.escape(fm.target or 'top level')}/ "
+                             f"<i>(kept together)</i>")
         by_folder: dict[str, int] = {}
         for m in plan.auto:
             by_folder[m.folder] = by_folder.get(m.folder, 0) + 1
@@ -327,12 +413,12 @@ def _run_locked(cfg, args) -> int:
         if applied.failed:
             lines.append(f"\n⚠️ {applied.failed} could not be moved")
         buttons = [[{"text": "↩️ Undo this run", "callback_data": "undo:yes"}]]
-        if plan.review:
-            lines.append(f"\n📋 <b>{len(plan.review)}</b> need your call")
-            buttons.insert(0, [{"text": f"📋 Review {len(plan.review)}",
+        if plan.review_count:
+            lines.append(f"\n📋 <b>{plan.review_count}</b> need your call")
+            buttons.insert(0, [{"text": f"📋 Review {plan.review_count}",
                                 "callback_data": "review"}])
         notify.notify(
-            cfg, f"Moved {applied.moved}, {len(plan.review)} need review",
+            cfg, f"Moved {applied.moved}, {plan.review_count} need review",
             subtitle=f"run {run_id}",
             telegram_text="\n".join(lines), buttons=buttons)
     console.print(f"report: {rpt}")
@@ -393,80 +479,65 @@ def cmd_review(args) -> int:
         console.print("nothing queued")
         return 0
 
+    from . import reviewing
+
     if args.list:
         t = Table(show_header=True, header_style="bold")
-        t.add_column("file", overflow="fold")
+        t.add_column("item", overflow="fold")
         t.add_column("why", overflow="fold")
         t.add_column("suggested", overflow="fold")
         for i in items:
-            t.add_row(Path(i["path"]).name, i["why"],
-                      Path(i["suggestion"]).parent.name if i["suggestion"] else "-")
+            name = Path(i["path"]).name + ("/" if i.get("type") == "folder" else "")
+            t.add_row(name, i["why"], reviewing.suggested_folder(i) or "-")
         console.print(t)
         return 0
 
     run_id = journal.new_run_id()
     jr = journal.Journal(cfg, run_id)
-    allowed = tuple(cfg.scan_roots) + tuple(cfg.media_destinations.values())
     moved = kept = trashed = 0
 
     for i in items:
         src = Path(i["path"])
-        console.print(f"\n[bold]{src.name}[/bold]")
+        is_folder = i.get("type") == "folder"
+        if is_folder:
+            console.print(f"\n[bold]📁 {src.name}/[/bold]  (kept together, "
+                          f"{i.get('file_count', 0)} files)")
+        else:
+            console.print(f"\n[bold]{src.name}[/bold]")
         console.print(f"  in {src.parent}")
         console.print(f"  {i['why']}")
-        default = ""
-        if i["suggestion"]:
-            sug = Path(i["suggestion"])
-            default = sug.parent.name if sug.is_absolute() else i["suggestion"]
+        default = reviewing.suggested_folder(i)
+        if default:
             console.print(f"  suggested folder: [cyan]{default}[/cyan]")
+        keys = "enter=accept, s=skip, q=quit" + ("" if is_folder else ", d=delete")
         try:
-            ans = input("  folder (enter=accept, s=skip, d=delete, q=quit): ").strip()
+            ans = input(f"  folder ({keys}): ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\nstopped")
             break
         if ans.lower() == "q":
             break
-        if ans.lower() == "d":
-            from . import trash as trashmod
-            try:
-                done = trashmod.send_to_trash(src)
-            except trashmod.TrashError as e:
-                console.print(f"  [red]{e}[/red]")
+        if ans.lower() == "d" and not is_folder:
+            ok, msg = reviewing.trash_reviewed(cfg, i, jr=jr)
+            if ok:
+                trashed += 1
+                console.print(f"  [yellow]-> {host.TRASH_NAME}[/yellow] "
+                              f"(recover: {host.RESTORE_HINT})")
+            else:
                 kept += 1
-                continue
-            jr.record(journal.MoveEntry(
-                src=str(done.original), dst=str(done.trashed_to or ""),
-                sha256=done.sha, size=done.size, ts=time.time(),
-                created_dirs=[], hash_method=done.method, action="trash",
-                category=i.get("category", "manual"), confidence=1.0,
-                provider="manual"))
-            trashed += 1
-            console.print(f"  [yellow]-> {host.TRASH_NAME}[/yellow] "
-                          f"(recover: {host.RESTORE_HINT})")
+                console.print(f"  [red]{msg}[/red]")
             continue
-        if ans.lower() == "s" or (not ans and not default):
+        if ans.lower() in ("s", "d") or (not ans and not default):
             kept += 1
             continue
         folder = ans or default
-        root = Path(i["root"])
-        dest, why = safety.resolve_destination(root, folder, src.name, allowed)
-        if dest is None:
-            console.print(f"  [red]rejected: {why}[/red]")
-            kept += 1
-            continue
-        move = planner.PlannedMove(
-            record=scanner.FileRecord(
-                path=src, root=root, size=src.stat().st_size,
-                mtime=src.stat().st_mtime, ctime=src.stat().st_mtime,
-                ext=src.suffix.lower().lstrip(".")),
-            dest=dest, category=i.get("category", "manual"), folder=folder,
-            confidence=1.0, reason="chosen during review", provider="manual")
-        r = applier.apply_moves(cfg, [move], jr)
-        moved += r.moved
-        if r.errors:
-            console.print(f"  [red]{r.errors[0][1]}[/red]")
+        ok, msg = reviewing.move_reviewed(cfg, i, folder, jr=jr)
+        if ok:
+            moved += 1
+            console.print(f"  [green]-> {msg}/[/green]")
         else:
-            console.print(f"  [green]-> {folder}/[/green]")
+            kept += 1
+            console.print(f"  [red]{msg}[/red]")
 
     remaining = [i for i in items if Path(i["path"]).exists()]
     queue.write_text(json.dumps({"run_id": data.get("run_id"), "items": remaining},
@@ -503,6 +574,10 @@ def cmd_undo(args) -> int:
         return 0
     console.print(f"reversing {len(entries)} move(s) from run {target.stem}")
     res = applier.undo_run(cfg, target, dry_run=args.dry_run)
+    if res.restored and not args.dry_run:
+        cache = journal.Cache(cfg)
+        cache.forget_journal(target)          # those are unsorted again
+        cache.close()
     verb = "would restore" if args.dry_run else "restored"
     extra = f" ({res.untrashed} from the {host.TRASH_NAME})" if res.untrashed else ""
     console.print(f"[green]{verb} {res.restored}{extra}[/green], "

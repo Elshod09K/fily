@@ -33,10 +33,56 @@ class FileRecord:
 
     @property
     def rel(self) -> str:
+        """Relative path with forward slashes on every OS, so it reads and
+        compares the same on Windows as on a Mac."""
         try:
-            return str(self.path.relative_to(self.root))
+            return self.path.relative_to(self.root).as_posix()
         except ValueError:
             return self.path.name
+
+    @property
+    def depth(self) -> int:
+        """0 for a loose file at the top of its root, 1 one folder down, …"""
+        try:
+            return len(self.path.relative_to(self.root).parts) - 1
+        except ValueError:
+            return 0
+
+    @property
+    def folder_rel(self) -> str:
+        """The folder it sits in, relative to its root ("" at the top)."""
+        try:
+            parent = self.path.parent.relative_to(self.root)
+        except ValueError:
+            return ""
+        return "" if str(parent) == "." else parent.as_posix()
+
+
+@dataclass
+class FolderRecord:
+    """A subfolder, described well enough to judge it as a whole."""
+    path: Path
+    root: Path
+    files: list[str] = field(default_factory=list)     # direct children
+    subdirs: list[str] = field(default_factory=list)
+    file_count: int = 0                                 # all depths
+    total_size: int = 0
+    newest_mtime: float = 0.0
+    fingerprint: str = ""
+    folder_id: int = -1
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def rel(self) -> str:
+        return self.path.relative_to(self.root).as_posix()
+
+    @property
+    def depth(self) -> int:
+        """1 for a folder directly inside a root."""
+        return len(self.path.relative_to(self.root).parts)
 
 
 @dataclass
@@ -46,6 +92,7 @@ class ScanResult:
     pruned_dirs: list[tuple[Path, str]]
     existing_folders: dict[Path, list[str]]
     unreadable_roots: list[tuple[Path, str]] = field(default_factory=list)
+    folders: list[FolderRecord] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         return {
@@ -77,7 +124,7 @@ def _existing_subfolders(root: Path, limit: int = 60) -> list[str]:
                     or safety.project_marker(child)):
                 continue
             keep.append(n)
-            out.append(str(child.relative_to(root)))
+            out.append(child.relative_to(root).as_posix())
             if len(out) >= limit:
                 dirnames[:] = []
                 return sorted(out)
@@ -119,6 +166,9 @@ def scan(cfg: Config, roots: tuple[Path, ...] | None = None) -> ScanResult:
     pruned: list[tuple[Path, str]] = []
     existing: dict[Path, list[str]] = {}
     unreadable: list[tuple[Path, str]] = []
+    folders: dict[Path, FolderRecord] = {}
+    # per directory: direct regular files as (relative-to-dir name, size, mtime)
+    direct: dict[Path, list[tuple[str, int, float]]] = {}
 
     deny = tuple(cfg.deny_paths) + safety.HARD_DENY_ROOTS + safety.LIBRARY_ROOTS
 
@@ -131,15 +181,16 @@ def scan(cfg: Config, roots: tuple[Path, ...] | None = None) -> ScanResult:
             continue
         existing[root] = _existing_subfolders(root)
 
-        max_depth = max(0, cfg.behaviour.scan_depth - 1)
+        # scan_depth 0 = every level; N = files at most N levels deep
+        # (1 = only loose files at the top, the original behaviour).
+        limit = cfg.behaviour.scan_depth
+        max_depth = limit - 1 if limit > 0 else None
 
         for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
             here = Path(dirpath)
             depth = len(here.relative_to(root).parts)
 
-            # Beyond scan_depth a directory's contents are already organised:
-            # list it as a destination, never harvest files out of it.
-            if depth >= max_depth:
+            if max_depth is not None and depth >= max_depth:
                 for d in dirnames:
                     pruned.append((here / d, "below scan_depth; left intact"))
                 dirnames[:] = []
@@ -172,6 +223,11 @@ def scan(cfg: Config, roots: tuple[Path, ...] | None = None) -> ScanResult:
                     keep.append(d)
             dirnames[:] = keep
 
+            if here != root:
+                folders[here] = FolderRecord(path=here, root=root,
+                                             subdirs=sorted(keep))
+            seen = direct.setdefault(here, [])
+
             for fn in filenames:
                 p = here / fn
                 if safety.is_ignored_name(fn):
@@ -183,6 +239,8 @@ def scan(cfg: Config, roots: tuple[Path, ...] | None = None) -> ScanResult:
                     continue
                 if safety.is_bundle(p) and p.is_dir():
                     continue
+                if not host.hidden(fn, st) and not p.is_symlink():
+                    seen.append((fn, st.st_size, st.st_mtime))
                 reason = safety.skip_reason(p, st, cfg.behaviour.quarantine_hours)
                 if reason:
                     skipped.append((p, reason))
@@ -199,5 +257,45 @@ def scan(cfg: Config, roots: tuple[Path, ...] | None = None) -> ScanResult:
     files.sort(key=lambda f: (str(f.root), f.rel.lower()))
     for i, f in enumerate(files):
         f.file_id = i
+    folder_list = _summarize_folders(folders, direct)
     return ScanResult(files=files, skipped=skipped, pruned_dirs=pruned,
-                      existing_folders=existing, unreadable_roots=unreadable)
+                      existing_folders=existing, unreadable_roots=unreadable,
+                      folders=folder_list)
+
+
+def _summarize_folders(folders: dict[Path, "FolderRecord"],
+                       direct: dict[Path, list[tuple[str, int, float]]]
+                       ) -> list["FolderRecord"]:
+    """Roll each folder's files up into counts, size, newest change and a
+    content fingerprint.
+
+    The newest change covers every visible file, including ones skipped for
+    being too recent: a folder someone edited this morning must not be moved
+    as a whole. Hidden files are left out — Finder rewrites .DS_Store just
+    from browsing, which would make every folder look busy.
+    """
+    import hashlib
+    entries: dict[Path, list[tuple[str, int, float]]] = {p: [] for p in folders}
+    # Each file is added to every folder above it: O(files × depth), not
+    # O(folders²), so a large tree stays fast.
+    for d, items in direct.items():
+        anc = d
+        while anc in folders:
+            sub = d.relative_to(anc).as_posix()
+            for name, size, mtime in items:
+                entries[anc].append((name if sub == "." else f"{sub}/{name}", size, mtime))
+            anc = anc.parent
+    ordered = sorted(folders.values(), key=lambda f: (str(f.root), f.rel.lower()))
+    for f in ordered:
+        mine = entries[f.path]
+        f.files = sorted(name for name, _, _ in direct.get(f.path, []))
+        f.file_count = len(mine)
+        f.total_size = sum(size for _, size, _ in mine)
+        f.newest_mtime = max((m for _, _, m in mine), default=0.0)
+        h = hashlib.sha1()
+        for rel, size, mtime in sorted(mine):
+            h.update(f"{rel}\0{size}\0{int(mtime)}\n".encode("utf-8"))
+        f.fingerprint = h.hexdigest()
+    for i, f in enumerate(ordered):
+        f.folder_id = i
+    return ordered

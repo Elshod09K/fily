@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import applier, config as cfgmod, health, host, journal, planner, safety, scanner, telegram, trash
+from . import applier, config as cfgmod, health, host, journal, reviewing, telegram
 from .telegram import escape
 
 POLL_TIMEOUT = 50
@@ -109,18 +109,7 @@ def save_queue(cfg, items: list[dict]) -> None:
                  encoding="utf-8")
 
 
-def suggested_folder(item: dict) -> str:
-    s = item.get("suggestion") or ""
-    if not s:
-        return ""
-    p = Path(s)
-    if p.is_absolute():
-        root = Path(item["root"])
-        try:
-            return str(p.parent.relative_to(root))
-        except ValueError:
-            return p.parent.name
-    return s
+suggested_folder = reviewing.suggested_folder
 
 
 # ------------------------------------------------------------------- rendering
@@ -172,7 +161,35 @@ def fmt_health(cfg) -> str:
     return "\n".join(lines)
 
 
+def fmt_folder_card(item: dict, index: int, total: int) -> tuple[str, list[list[dict]]]:
+    """A whole folder waiting for a decision. It moves as one piece or not
+    at all, so there is no Delete and no Send me it."""
+    path = Path(item["path"])
+    folder = suggested_folder(item)
+    names = item.get("names") or []
+    lines = [f"<b>Review {index + 1} of {total}</b>", "",
+             f"📁 <code>{escape(path.name)}/</code>  <i>(kept together)</i>",
+             f"in <i>{escape(Path(item['root']).name)}/</i>  ·  "
+             f"{item.get('file_count', 0)} files  ·  {_human_size(item.get('size') or 0)}",
+             "", f"<i>{escape(item.get('why', ''))}</i>"]
+    if names:
+        shown = ", ".join(names[:6]) + ("…" if len(names) > 6 else "")
+        lines += ["", f"<blockquote>{escape(shown)}</blockquote>"]
+    if folder:
+        lines += ["", f"Suggested: <b>{escape(folder)}/</b>"]
+    buttons: list[list[dict]] = []
+    if folder:
+        buttons.append([{"text": f"✅ Move to {folder[:24]}", "callback_data": f"rv:a:{index}"}])
+    buttons.append([{"text": f"👁 Show in {host.FILE_MANAGER}", "callback_data": f"rv:f:{index}"}])
+    buttons.append([{"text": "✏️ Different folder", "callback_data": f"rv:e:{index}"},
+                    {"text": "⏭ Skip", "callback_data": f"rv:s:{index}"}])
+    buttons.append([{"text": "✖️ Stop", "callback_data": "rv:q"}])
+    return "\n".join(lines), buttons
+
+
 def fmt_review_card(item: dict, index: int, total: int) -> tuple[str, list[list[dict]]]:
+    if item.get("type") == "folder":
+        return fmt_folder_card(item, index, total)
     name = Path(item["path"]).name
     folder = suggested_folder(item)
     root = Path(item["root"]).name
@@ -298,8 +315,9 @@ def fmt_help(cfg) -> str:
 
 HELP = """<b>Fily — your file organizer</b>
 
-I tidy loose files in {folders} every day at <b>{run_at}</b>, and tell you \
-what I did.
+I tidy {folders} — subfolders included — every day at <b>{run_at}</b>, and \
+tell you what I did. Folders whose files belong together are kept together, \
+and anything already sorted stays put.
 
 <b>/status</b> — recent runs and what is waiting
 <b>/review</b> — go through the files I wasn't sure about
@@ -326,37 +344,8 @@ If I can't reach any AI provider I move <b>nothing</b> and tell you at \
 # -------------------------------------------------------------------- actions
 
 def do_move(cfg, item: dict, folder: str) -> tuple[bool, str]:
-    """Apply one reviewed file. Returns (ok, message)."""
-    src = Path(item["path"])
-    root = Path(item["root"])
-    if not src.exists():
-        return False, "that file is no longer there"
-
-    allowed = tuple(cfg.scan_roots) + tuple(cfg.media_destinations.values())
-    dest, why = safety.resolve_destination(root, folder, src.name, allowed)
-    if dest is None:
-        return False, f"can't use that folder — {why}"
-
-    try:
-        st = src.stat()
-    except OSError as e:
-        return False, f"unreadable: {e.strerror}"
-
-    record = scanner.FileRecord(
-        path=src, root=root, size=st.st_size, mtime=st.st_mtime,
-        ctime=getattr(st, "st_birthtime", st.st_ctime),
-        ext=src.suffix.lower().lstrip("."))
-    move = planner.PlannedMove(
-        record=record, dest=dest, category=item.get("category", "manual"),
-        folder=folder, confidence=1.0, reason="chosen in Telegram",
-        provider="manual")
-
-    run_id = journal.new_run_id()
-    jr = journal.Journal(cfg, run_id)
-    result = applier.apply_moves(cfg, [move], jr)
-    if result.errors:
-        return False, result.errors[0][1]
-    return True, folder
+    """Apply one reviewed file or folder. Returns (ok, message)."""
+    return reviewing.move_reviewed(cfg, item, folder, provider="telegram")
 
 
 def trigger_run(cfg, chat_id: int) -> None:
@@ -520,7 +509,11 @@ def handle_callback(cfg, chat_id: int, cb: dict, session: Session) -> None:
             telegram.send(chat_id, "There is no run left to undo.")
             return
         res = applier.undo_run(cfg, target)
-        msg = [f"↩️ Restored <b>{res.restored}</b> file(s)."]
+        if res.restored:
+            cache = journal.Cache(cfg)
+            cache.forget_journal(target)      # those are unsorted again
+            cache.close()
+        msg = [f"↩️ Restored <b>{res.restored}</b> item(s)."]
         if res.skipped:
             msg.append(f"{res.skipped} left alone:")
             msg += [f"• {escape(Path(p).name)} — {escape(w)}"
@@ -555,6 +548,10 @@ def handle_callback(cfg, chat_id: int, cb: dict, session: Session) -> None:
         telegram.answer_callback(cb_id, "Skipped")
         session.index += 1
         show_current(cfg, chat_id, session)
+        return
+
+    if action in ("d", "D", "p") and item.get("type") == "folder":
+        telegram.answer_callback(cb_id, "Not available for a whole folder")
         return
 
     if action == "d":
@@ -593,22 +590,12 @@ def handle_callback(cfg, chat_id: int, cb: dict, session: Session) -> None:
         return
 
     if action == "D":
-        src = Path(item["path"])
-        try:
-            done = trash.send_to_trash(src)
-        except trash.TrashError as e:
-            telegram.answer_callback(cb_id, str(e)[:180], alert=True)
+        ok, msg = reviewing.trash_reviewed(cfg, item, provider="telegram")
+        if not ok:
+            telegram.answer_callback(cb_id, msg[:180], alert=True)
             show_current(cfg, chat_id, session)
             return
-        run_id = journal.new_run_id()
-        jr = journal.Journal(cfg, run_id)
-        jr.record(journal.MoveEntry(
-            src=str(done.original), dst=str(done.trashed_to or ""),
-            sha256=done.sha, size=done.size, ts=time.time(), created_dirs=[],
-            hash_method=done.method, action="trash",
-            category=item.get("category", "manual"), confidence=1.0,
-            provider="telegram"))
-        telegram.answer_callback(cb_id, "Moved to Trash")
+        telegram.answer_callback(cb_id, f"Moved to the {host.TRASH_NAME}")
         save_queue(cfg, [i for i in load_queue(cfg) if i["path"] != item["path"]])
         session.index += 1
         show_current(cfg, chat_id, session)
@@ -619,6 +606,7 @@ def handle_callback(cfg, chat_id: int, cb: dict, session: Session) -> None:
         session.awaiting_folder_for = idx
         telegram.send(chat_id,
                       f"Which folder should <code>{escape(Path(item['path']).name)}"
+                      f"{'/' if item.get('type') == 'folder' else ''}"
                       f"</code> go in?\n\n"
                       "<i>Reply with a name, e.g. <code>Exams/SAT</code>. "
                       "Send <b>-</b> to cancel.</i>")

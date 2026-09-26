@@ -36,16 +36,22 @@ organizer/
 
 ### A run
 
-1. **Scan** — loose files at the top of each folder; exclusions applied.
-2. **Extract** — up to 800 characters of text from documents; images get
+1. **Scan** — every level of every chosen folder, with exclusions applied;
+   each subfolder is summarized (files, size, newest change, a content
+   fingerprint).
+2. **Judge folders** — each subfolder is a *set*, a *category* or a *dump*
+   (see below). Nothing inside a set is looked at.
+3. **Extract** — up to 800 characters of text from documents; images get
    name and metadata only.
-3. **Dedupe** — exact duplicates found by hash. They never reach the AI.
-4. **Cache** — a file whose sha256 was classified before reuses that decision,
-   so a steady-state night classifies only genuinely new files.
-5. **Classify** — batches go down the provider chain.
-6. **Plan** — every label validated; each file goes to auto-apply or review.
-7. **Apply** — moves and deletions journaled *before* they are considered done.
-8. **Report** — Markdown report, desktop notification, Telegram message.
+4. **Dedupe** — exact duplicates found by hash. They never reach the AI.
+5. **Remember** — a file Fily (or you, through review) already placed is
+   never re-sorted, and a file whose sha256 was classified before reuses that
+   decision, so a steady-state night asks the AI about nothing old.
+6. **Classify** — batches go down the provider chain.
+7. **Plan** — every label validated; each file goes to auto-apply or review.
+8. **Apply** — whole sets first, then files; every move and deletion is
+   journaled *before* it is considered done.
+9. **Report** — Markdown report, desktop notification, Telegram message.
 
 ### Three scheduled jobs
 
@@ -137,9 +143,52 @@ corrupted.
 routed into them, and on most Macs they hold nothing but Apple-managed
 libraries.
 
-**Only loose files.** With `scan_depth: 1`, anything already inside a subfolder
-is by definition organized, and existing folders — including extracted
-archives and tool directories — are left intact.
+## Subfolders
+
+Looking inside subfolders is where an organizer can do the most damage: pull a
+file out of a folder you arranged on purpose, or scatter the pieces of
+something that only makes sense together. So every subfolder is judged as a
+whole before anything inside it is touched (`triage.py`):
+
+| Kind | Meaning | What happens |
+|---|---|---|
+| **set** | the files belong together: an extracted download, an exam pack, a project, one month's documents | filed as one piece, or left alone; nothing inside is examined or deleted |
+| **category** | an organizing folder for one kind of thing | looked inside; a file that fits stays |
+| **dump** | a catch-all with no theme | looked inside and sorted out; never offered as a destination |
+
+Judgements go **top-down**, so a set's subfolders are never even asked about.
+Folders Fily created are categories without asking; folders it already filed
+as a set stay put. An unanswered or unrecognized judgement means **set**:
+keeping a folder together is always safe, splitting one is not. Category and
+dump verdicts are remembered by location (a category stays a category as files
+come and go); set verdicts by content fingerprint, so adding a file to a set
+gets it looked at again.
+
+Stability rules, so folders don't churn night after night:
+
+- **Placed means placed.** Every move — automatic or chosen in review — is
+  remembered (`placements` in `cache.db`, backfilled once from older journals).
+  A placed file is never re-sorted, even if you later moved it yourself. Only
+  a *loose* copy of a placed file is looked at again, as a possible duplicate.
+- **Already fitting means staying.** A nested file's prompt says where it is;
+  if the AI answers with that same folder, nothing happens and nothing is
+  queued.
+- **Pulling a file out of a category needs near-certainty** (0.95); below
+  that it goes to review. Files in a dump, and loose files, use the normal
+  rules. A set loose at the top moves at the normal threshold; one already
+  inside a folder needs near-certainty too.
+- **A set never moves into itself or into another set**, and files are never
+  filed into a set's insides (its top level is fine). A file headed into a set
+  that moves in the same run follows it; if the set's move fails, so does the
+  file's.
+
+Moving a set is a single `rename` — same volume, atomic, never a copy. It is
+refused if any file inside is open or changed within the quarantine window,
+journaled first with a manifest of its contents, and undone only if the
+contents still match exactly.
+
+`scan_depth: 1` restores the original behaviour: only loose files at the top
+of each folder, no folder judgements.
 
 ### The AI cannot cause an unsafe write
 

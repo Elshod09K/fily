@@ -273,6 +273,21 @@ def is_file_open(path: Path) -> bool:
     return False
 
 
+def folder_in_use(path: Path, limit: int = 2000) -> bool:
+    """Is any file under `path` open? Windows refuses to rename a folder with
+    an open file inside anyway; this just says so up front. A folder with
+    more files than `limit` is assumed busy rather than probed forever."""
+    n = 0
+    for dirpath, _, filenames in os.walk(path):
+        for fn in filenames:
+            n += 1
+            if n > limit:
+                return True
+            if is_file_open(Path(dirpath) / fn):
+                return True
+    return False
+
+
 def pid_alive(pid: int) -> bool:
     """Never os.kill(pid, 0) here: on Windows that *terminates* the process."""
     if sys.platform != "win32":

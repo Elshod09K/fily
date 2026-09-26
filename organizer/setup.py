@@ -241,10 +241,10 @@ def folders(p: Prompter, existing: list[str], folders_arg: str | None) -> list[s
     if folders_arg:
         chosen = [f.strip() for f in folders_arg.split(",") if f.strip()]
     else:
-        console.print("Only loose files at the top of each folder are touched — "
-                      "anything already in a subfolder is left alone. Code "
-                      "projects, apps and Photos/Music libraries are always "
-                      "skipped.")
+        console.print("Subfolders are included. Each is judged as a whole first: "
+                      "folders whose files belong together are kept together, "
+                      "and anything already sorted stays put. Code projects, "
+                      "apps and Photos/Music libraries are always skipped.")
         for f in defaults:
             console.print(f"  • {f}")
         chosen = list(defaults)
@@ -458,8 +458,9 @@ def run(args) -> int:
     console.print("\n[bold]Fily setup[/bold] — a few questions, then it runs "
                   "on its own.\n")
     console.print(
-        "[dim]What it does: every day it looks at loose files in the folders "
-        "you choose and moves each into a sensible subfolder.\n"
+        "[dim]What it does: every day it goes through the folders you choose, "
+        "subfolders included, and files everything unsorted into a sensible "
+        "place — keeping folders that belong together in one piece.\n"
         f"What it never does: erase anything (deleting means the {host.TRASH_NAME}), touch "
         "code projects, apps or photo libraries, or send your files anywhere — "
         "only names and short text excerpts go to the AI.[/dim]")

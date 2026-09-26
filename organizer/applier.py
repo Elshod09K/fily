@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import safety, trash
+from . import host, safety, trash
 from .config import Config
 from .hashing import content_id, sha256_file, verify_content
 from .journal import Journal, MoveEntry, read_journal
@@ -23,6 +23,7 @@ from .journal import Journal, MoveEntry, read_journal
 @dataclass
 class MoveResult:
     moved: int = 0
+    folders_moved: int = 0
     trashed: int = 0
     trashed_bytes: int = 0
     failed: int = 0
@@ -146,6 +147,72 @@ def _trash_one(cfg, action, journal, dry_run: bool) -> tuple[bool, str]:
     return True, "trashed"
 
 
+def folder_manifest(path: Path) -> tuple[str, int, int, float]:
+    """(digest, file count, total size, newest change) over a folder's
+    visible files. Identifies its contents without reading them."""
+    import hashlib
+    entries = []
+    for dirpath, _, filenames in os.walk(path):
+        for fn in filenames:
+            if safety.is_ignored_name(fn) or fn.startswith("."):
+                continue
+            p = Path(dirpath) / fn
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            entries.append((p.relative_to(path).as_posix(), st.st_size, st.st_mtime))
+    h = hashlib.sha1()
+    for rel, size, mtime in sorted(entries):
+        h.update(f"{rel}\0{size}\0{int(mtime)}\n".encode("utf-8"))
+    return (h.hexdigest(), len(entries), sum(e[1] for e in entries),
+            max((e[2] for e in entries), default=0.0))
+
+
+def apply_folder_moves(cfg, moves, journal, dry_run: bool = False,
+                       respect_quarantine: bool = True) -> MoveResult:
+    """Move whole sets. Same guarantees as file moves: nothing busy, nothing
+    recently changed, journaled before the rename, never overwriting."""
+    result = MoveResult()
+    quarantine = cfg.behaviour.quarantine_hours * 3600
+    for m in moves:
+        src = m.folder.path
+        try:
+            if not src.is_dir() or src.is_symlink():
+                result.errors.append((str(src), "folder is no longer there"))
+                result.failed += 1
+                continue
+            digest, count, size, newest = folder_manifest(src)
+            if respect_quarantine and newest and time.time() - newest < quarantine:
+                result.errors.append((str(src), "something inside changed recently"))
+                result.failed += 1
+                continue
+            if host.folder_in_use(src):
+                result.errors.append((str(src), "a file inside is open"))
+                result.failed += 1
+                continue
+            dest = safety.unique_destination(m.dest)
+            if dest == src or src in dest.parents:
+                result.errors.append((str(src), "would move the folder into itself"))
+                result.failed += 1
+                continue
+            if dry_run:
+                result.folders_moved += 1
+                continue
+            created = _ensure_dirs(dest.parent)
+            journal.record(MoveEntry(
+                src=str(src), dst=str(dest), sha256=digest, size=size,
+                ts=time.time(), created_dirs=created, hash_method="manifest",
+                action="move_dir", category=m.category, confidence=m.confidence,
+                provider="ai"))
+            os.rename(src, dest)            # same volume: atomic, never a copy
+            result.folders_moved += 1
+        except OSError as e:
+            result.errors.append((str(src), f"{type(e).__name__}: {e.strerror or e}"))
+            result.failed += 1
+    return result
+
+
 @dataclass
 class UndoResult:
     restored: int = 0
@@ -168,6 +235,32 @@ def undo_run(cfg: Config, journal_path: Path, dry_run: bool = False) -> UndoResu
     for e in reversed(entries):
         src, dst = Path(e.src), Path(e.dst)
         created_dirs.update(e.created_dirs or [])
+
+        if (e.action or "move") == "move_dir":
+            if not dst.is_dir():
+                res.problems.append((str(dst), "folder is no longer where it was moved"))
+                res.skipped += 1
+                continue
+            if src.exists():
+                res.problems.append((str(src), "something is back at the original path"))
+                res.skipped += 1
+                continue
+            if folder_manifest(dst)[0] != e.sha256:
+                res.problems.append((str(dst), "folder's contents changed since the move; "
+                                               "not restored"))
+                res.skipped += 1
+                continue
+            if dry_run:
+                res.restored += 1
+                continue
+            try:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(dst, src)
+                res.restored += 1
+            except OSError as err:
+                res.problems.append((str(dst), f"{type(err).__name__}: {err}"))
+                res.skipped += 1
+            continue
 
         if (e.action or "move") == "trash":
             if dry_run:
